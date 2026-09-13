@@ -1,0 +1,13 @@
+{
+  "type": "player",
+  "domain": "triad_matrix_test",
+  "stage": "experimental",
+  "name": "Triad Matrix Prototype",
+  "description": "Experimental Music Assistant player provider for a Triad AMS matrix using a shared Sonos Connect transport.",
+  "codeowners": ["@andrewwroberts"],
+  "requirements": [],
+  "documentation": "https://github.com/andrewwroberts/server/tree/triad-matrix-prototype-2.10.3/music_assistant/providers/triad_matrix_test",
+  "icon": "speaker-multiple",
+  "multi_instance": false,
+  "builtin": false
+}
