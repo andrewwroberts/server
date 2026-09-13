@@ -3,40 +3,140 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any, TYPE_CHECKING
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, TypedDict
 
-from music_assistant_models.enums import PlaybackState
+from music_assistant_models.enums import PlaybackState, PlayerFeature
 from music_assistant_models.errors import PlayerCommandFailed
 
+from music_assistant.controllers.players.constants import PlayerLockPurpose
 from music_assistant.models.player_provider import PlayerProvider
 
 from .player import TriadMatrixTestPlayer
 
 if TYPE_CHECKING:
+    from music_assistant_models.config_entries import ConfigEntry
+
     from music_assistant.models.player import Player
 
 
-# Physical transport:
-#
-# Connect 1
-#   Sonos ID: RINCON_B8E937997EE801400
-#   Home Assistant: media_player.connect_1
-#   Triad AMS input: 3
-#
-BACKEND_PLAYER_ID = "RINCON_B8E937997EE801400"
-TRIAD_SOURCE_NAME = "Connect 1"
+@dataclass(frozen=True, slots=True)
+class BusDefinition:
+    """Describe one physical Sonos-to-Triad source bus."""
 
-# Deliberately only two low-disruption rooms for the first experiment.
-ROOMS = {
-    "triad_test_master_bedroom": {
-        "name": "Triad Test - Master Bedroom",
-        "entity_id": "media_player.triad_master_bedroom",
-        "output": 3,
+    source_name: str
+    backend_player_id: str
+    backend_entity_id: str
+    triad_input: int
+
+
+@dataclass(slots=True)
+class MatrixBus:
+    """Track the runtime owner of one physical source bus."""
+
+    definition: BusDefinition
+    owner_id: str | None = None
+
+    @property
+    def source_name(self) -> str:
+        """Return the Home Assistant source name for this bus."""
+        return self.definition.source_name
+
+    @property
+    def backend_player_id(self) -> str:
+        """Return the native Music Assistant backend player ID."""
+        return self.definition.backend_player_id
+
+
+class RoomDefinition(TypedDict):
+    """Describe one logical Triad room."""
+
+    name: str
+    entity_id: str
+    output: int
+
+
+BUS_DEFINITIONS = (
+    BusDefinition(
+        source_name="Connect 1",
+        backend_player_id="RINCON_B8E937997EE801400",
+        backend_entity_id="media_player.connect_1",
+        triad_input=3,
+    ),
+    BusDefinition(
+        source_name="Connect 2",
+        backend_player_id="RINCON_B8E937997EEE01400",
+        backend_entity_id="media_player.connect_2",
+        triad_input=4,
+    ),
+)
+
+ROOMS: dict[str, RoomDefinition] = {
+    "triad_test_master_shower": {
+        "name": "Triad Test - Master Shower",
+        "entity_id": "media_player.triad_master_shower",
+        "output": 1,
     },
     "triad_test_master_bath": {
         "name": "Triad Test - Master Bath",
         "entity_id": "media_player.triad_master_bath",
         "output": 2,
+    },
+    "triad_test_master_bedroom": {
+        "name": "Triad Test - Master Bedroom",
+        "entity_id": "media_player.triad_master_bedroom",
+        "output": 3,
+    },
+    "triad_test_kitchen": {
+        "name": "Triad Test - Kitchen",
+        "entity_id": "media_player.triad_kitchen",
+        "output": 4,
+    },
+    "triad_test_family_room": {
+        "name": "Triad Test - Family Room",
+        "entity_id": "media_player.triad_family_room",
+        "output": 5,
+    },
+    "triad_test_dining_room": {
+        "name": "Triad Test - Dining Room",
+        "entity_id": "media_player.triad_dining_room",
+        "output": 6,
+    },
+    "triad_test_library": {
+        "name": "Triad Test - Library",
+        "entity_id": "media_player.triad_library",
+        "output": 7,
+    },
+    "triad_test_breakfast_room": {
+        "name": "Triad Test - Breakfast Room",
+        "entity_id": "media_player.triad_breakfast_room",
+        "output": 8,
+    },
+    "triad_test_theater_room": {
+        "name": "Triad Test - Theater Room",
+        "entity_id": "media_player.triad_theater_room",
+        "output": 9,
+    },
+    "triad_test_outdoor_eating_area": {
+        "name": "Triad Test - Outdoor Eating Area",
+        "entity_id": "media_player.triad_outdoor_eating_area",
+        "output": 10,
+    },
+    "triad_test_fire_pit": {
+        "name": "Triad Test - Fire Pit",
+        "entity_id": "media_player.triad_fire_pit",
+        "output": 11,
+    },
+    "triad_test_basement_weight_room": {
+        "name": "Triad Test - Basement Weight Room",
+        "entity_id": "media_player.triad_basement_weight_room",
+        "output": 12,
+    },
+    "triad_test_basement_rec_room": {
+        "name": "Triad Test - Basement Rec Room",
+        "entity_id": "media_player.triad_basement_rec_room",
+        "output": 13,
     },
 }
 
@@ -48,23 +148,22 @@ class TriadMatrixTestProvider(PlayerProvider):
         """Initialize provider."""
         super().__init__(*args, **kwargs)
         self._players_by_id: dict[str, TriadMatrixTestPlayer] = {}
-        self._bus_owner: str | None = None
+        self._buses = [MatrixBus(definition) for definition in BUS_DEFINITIONS]
         self._bus_lock = asyncio.Lock()
 
-    async def get_config_entries(self) -> tuple:
+    async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
         """Return provider configuration entries."""
         return ()
 
     async def handle_async_init(self) -> None:
         """Initialize runtime state."""
         self.logger.info(
-            "Triad prototype initialized: backend=%s source=%s",
-            BACKEND_PLAYER_ID,
-            TRIAD_SOURCE_NAME,
+            "Triad prototype initialized with buses: %s",
+            ", ".join(f"{bus.source_name}={bus.backend_player_id}" for bus in self._buses),
         )
 
     async def loaded_in_mass(self) -> None:
-        """Register the two experimental room players."""
+        """Register the logical Triad room players."""
         await self.discover_players()
 
     async def unload(self, is_removed: bool = False) -> None:
@@ -72,9 +171,11 @@ class TriadMatrixTestProvider(PlayerProvider):
         for player in list(self._players_by_id.values()):
             await self.mass.players.unregister(player.player_id)
         self._players_by_id.clear()
+        for bus in self._buses:
+            bus.owner_id = None
 
     async def discover_players(self) -> None:
-        """Register Kitchen and Dining Room."""
+        """Register all configured Triad rooms."""
         for player_id, room in ROOMS.items():
             if player_id in self._players_by_id:
                 continue
@@ -96,11 +197,6 @@ class TriadMatrixTestProvider(PlayerProvider):
                 player.output_number,
             )
 
-    @property
-    def bus_owner(self) -> str | None:
-        """Return the logical room currently owning Connect 1."""
-        return self._bus_owner
-
     def get_room_player(
         self,
         player_id: str,
@@ -108,23 +204,35 @@ class TriadMatrixTestProvider(PlayerProvider):
         """Return one of this provider's logical room players."""
         return self._players_by_id.get(player_id)
 
+    def get_bus_for_owner(self, owner_id: str) -> MatrixBus | None:
+        """Return the source bus reserved by a logical room leader."""
+        return next(
+            (bus for bus in self._buses if bus.owner_id == owner_id),
+            None,
+        )
+
     def get_backend_player(
         self,
+        bus: MatrixBus,
         required: bool = True,
     ) -> Player | None:
-        """Return the native MA Sonos Connect player."""
-        player = self.mass.players.get_player(BACKEND_PLAYER_ID)
+        """Return the native Music Assistant renderer for a source bus."""
+        player = self.mass.players.get_player(bus.backend_player_id)
 
         if player is not None and player.state.available:
             return player
 
         if required:
             raise PlayerCommandFailed(
-                "Triad prototype requires native Sonos player "
-                f"{BACKEND_PLAYER_ID}, but it is not currently available."
+                f"Triad {bus.source_name} requires native Sonos player "
+                f"{bus.backend_player_id}, but it is not currently available."
             )
 
         return None
+
+    def has_available_backend(self) -> bool:
+        """Return whether at least one Sonos source bus is available."""
+        return any(self.get_backend_player(bus, required=False) is not None for bus in self._buses)
 
     def get_hass_provider(self, required: bool = True) -> Any:
         """Return MA's existing Home Assistant provider."""
@@ -163,18 +271,268 @@ class TriadMatrixTestProvider(PlayerProvider):
 
     async def get_zone_state(self, entity_id: str) -> dict[str, Any]:
         """Return current state of a Triad HA media_player."""
-        hass_provider = self.get_hass_provider()
+        states = await self._get_zone_states([entity_id])
 
-        states = await hass_provider.get_states(
-            entity_ids=[entity_id],
-        )
+        if entity_id not in states:
+            raise PlayerCommandFailed(f"Home Assistant did not return state for {entity_id}.")
 
-        if not states:
+        return states[entity_id]
+
+    async def claim_bus(
+        self,
+        owner_id: str,
+        member_ids: list[str],
+    ) -> tuple[MatrixBus, Player]:
+        """
+        Reserve one idle source bus for a logical playback session.
+
+        :param owner_id: Logical room leader that owns the playback session.
+        :param member_ids: Logical rooms that will initially hear the session.
+        """
+        async with self._bus_lock:
+            if bus := self.get_bus_for_owner(owner_id):
+                backend = self.get_backend_player(bus)
+                assert backend is not None
+                return bus, backend
+
+            zone_entities = [player.zone_entity for player in self._players_by_id.values()]
+            states = await self._get_zone_states(zone_entities)
+            if missing := set(zone_entities) - states.keys():
+                raise PlayerCommandFailed(
+                    "Home Assistant did not return every Triad room state; "
+                    f"no source bus was claimed. Missing: {', '.join(sorted(missing))}."
+                )
+            requested_members = set(member_ids)
+            unavailable: list[str] = []
+            busy: list[str] = []
+
+            for bus in self._buses:
+                if bus.owner_id is not None:
+                    owner = self.get_room_player(bus.owner_id)
+                    owner_name = owner.display_name if owner else bus.owner_id
+                    busy.append(f"{bus.source_name} is reserved by {owner_name}")
+                    continue
+
+                backend = self.get_backend_player(bus, required=False)
+                if backend is None:
+                    unavailable.append(f"{bus.source_name} is unavailable")
+                    continue
+
+                if backend.state.playback_state != PlaybackState.IDLE:
+                    busy.append(
+                        f"{bus.source_name} is already {backend.state.playback_state.value}"
+                    )
+                    continue
+
+                routed_elsewhere = [
+                    player.display_name
+                    for player_id, player in self._players_by_id.items()
+                    if player_id not in requested_members
+                    and (states.get(player.zone_entity, {}).get("attributes") or {}).get("source")
+                    == bus.source_name
+                ]
+                if routed_elsewhere:
+                    busy.append(
+                        f"{bus.source_name} is already routed to {', '.join(routed_elsewhere)}"
+                    )
+                    continue
+
+                bus.owner_id = owner_id
+                self.logger.info(
+                    "TRIAD BUS CLAIM: %s claimed %s (%s)",
+                    owner_id,
+                    bus.source_name,
+                    backend.display_name,
+                )
+                return bus, backend
+
+            detail = "; ".join([*busy, *unavailable])
             raise PlayerCommandFailed(
-                f"Home Assistant did not return state for {entity_id}."
+                "No free Triad music source is available; existing playback "
+                f"and routes were left untouched. {detail}"
             )
 
-        return states[0]
+    async def release_bus(self, owner_id: str) -> None:
+        """Release a source bus after verifying no Triad room remains routed to it."""
+        async with self._bus_lock:
+            bus = self.get_bus_for_owner(owner_id)
+            if bus is None:
+                return
+
+            zone_entities = [player.zone_entity for player in self._players_by_id.values()]
+            states = await self._get_zone_states(zone_entities)
+            if missing := set(zone_entities) - states.keys():
+                raise PlayerCommandFailed(
+                    f"Refusing to release {bus.source_name} without every Triad "
+                    f"room state. Missing: {', '.join(sorted(missing))}."
+                )
+            routed_rooms = [
+                player.display_name
+                for player in self._players_by_id.values()
+                if (states.get(player.zone_entity, {}).get("attributes") or {}).get("source")
+                == bus.source_name
+            ]
+            if routed_rooms:
+                raise PlayerCommandFailed(
+                    f"Refusing to release {bus.source_name} while it remains "
+                    f"routed to {', '.join(routed_rooms)}."
+                )
+
+            self.logger.info(
+                "TRIAD BUS RELEASE: %s released %s",
+                owner_id,
+                bus.source_name,
+            )
+            bus.owner_id = None
+
+    async def prepare_backend(self, bus: MatrixBus, backend: Player) -> None:
+        """Set a Sonos Connect to the fixed line-level source volume."""
+        missing = {
+            PlayerFeature.VOLUME_SET,
+            PlayerFeature.VOLUME_MUTE,
+        } - backend.supported_features
+        if missing:
+            raise PlayerCommandFailed(
+                f"{bus.source_name} cannot be fixed at source level because "
+                f"{backend.display_name} lacks {', '.join(x.name for x in missing)}."
+            )
+
+        async with self.mass.players.get_player_lock(
+            backend.player_id,
+            PlayerLockPurpose.VOLUME,
+        ):
+            if backend.state.volume_level != 100:
+                await backend.volume_set(100)
+            if backend.state.volume_muted is not False:
+                await backend.volume_mute(False)
+
+        for _attempt in range(20):
+            if backend.state.volume_level == 100 and backend.state.volume_muted is False:
+                return
+            await asyncio.sleep(0.1)
+
+        raise PlayerCommandFailed(
+            f"{bus.source_name} did not confirm fixed source level; "
+            f"volume={backend.state.volume_level}, muted={backend.state.volume_muted}."
+        )
+
+    async def wait_for_backend_idle(self, bus: MatrixBus, backend: Player) -> None:
+        """Wait for a stopped source backend to report idle."""
+        for _attempt in range(20):
+            if backend.state.playback_state == PlaybackState.IDLE:
+                return
+            await asyncio.sleep(0.25)
+
+        raise PlayerCommandFailed(
+            f"{bus.source_name} did not report idle after stop; "
+            f"state={backend.state.playback_state.value}."
+        )
+
+    async def route_zone_to_bus(
+        self,
+        player: TriadMatrixTestPlayer,
+        bus: MatrixBus,
+    ) -> None:
+        """Route one Triad output to a reserved source bus."""
+        if bus.owner_id is None:
+            raise PlayerCommandFailed(
+                f"Cannot route {player.display_name}: {bus.source_name} is not reserved."
+            )
+
+        state = await self.get_zone_state(player.zone_entity)
+        current_source = (state.get("attributes") or {}).get("source")
+        if current_source not in (None, bus.source_name):
+            raise PlayerCommandFailed(
+                f"Refusing to reroute {player.display_name} from "
+                f"{current_source} to {bus.source_name}."
+            )
+
+        self.logger.info(
+            "TRIAD ROUTE: %s (output %s) -> %s (input %s)",
+            player.display_name,
+            player.output_number,
+            bus.source_name,
+            bus.definition.triad_input,
+        )
+
+        await self._verified_media_player_command(
+            entity_id=player.zone_entity,
+            service="select_source",
+            service_data={"source": bus.source_name},
+            verifier=lambda new_state: (
+                new_state.get("state") not in ("off", "unavailable", "unknown", None)
+                and (new_state.get("attributes") or {}).get("source") == bus.source_name
+            ),
+            description=(
+                f"route {player.display_name} output {player.output_number} to {bus.source_name}"
+            ),
+        )
+
+    async def turn_off_zone(self, player: TriadMatrixTestPlayer) -> None:
+        """Disconnect exactly one Triad output and verify it is off."""
+        self.logger.info(
+            "TRIAD OFF: %s (output %s)",
+            player.display_name,
+            player.output_number,
+        )
+
+        await self._verified_media_player_command(
+            entity_id=player.zone_entity,
+            service="turn_off",
+            service_data=None,
+            verifier=lambda state: (
+                state.get("state") == "off"
+                and (state.get("attributes") or {}).get("source") is None
+            ),
+            description=(f"disconnect {player.display_name} output {player.output_number}"),
+        )
+
+    async def set_zone_volume(
+        self,
+        player: TriadMatrixTestPlayer,
+        volume_level: int,
+    ) -> None:
+        """Set one Triad output volume and verify the resulting level."""
+        expected = max(0, min(100, volume_level)) / 100
+
+        await self._verified_media_player_command(
+            entity_id=player.zone_entity,
+            service="volume_set",
+            service_data={"volume_level": expected},
+            verifier=lambda state: self._volume_matches(state, expected),
+            description=(
+                f"set {player.display_name} output {player.output_number} volume to {volume_level}%"
+            ),
+        )
+
+    async def set_zone_mute(
+        self,
+        player: TriadMatrixTestPlayer,
+        muted: bool,
+    ) -> None:
+        """Set one Triad output mute state and verify it."""
+        await self._verified_media_player_command(
+            entity_id=player.zone_entity,
+            service="volume_mute",
+            service_data={"is_volume_muted": muted},
+            verifier=lambda state: (state.get("attributes") or {}).get("is_volume_muted") is muted,
+            description=(f"set {player.display_name} output {player.output_number} muted={muted}"),
+        )
+
+    async def _get_zone_states(
+        self,
+        entity_ids: list[str],
+    ) -> dict[str, dict[str, Any]]:
+        """Return Home Assistant states keyed by entity ID."""
+        hass_provider = self.get_hass_provider()
+        states = await hass_provider.get_states(entity_ids=entity_ids)
+        return {str(state["entity_id"]): state for state in states if state.get("entity_id")}
+
+    @staticmethod
+    def _volume_matches(state: dict[str, Any], expected: float) -> bool:
+        """Return whether a Home Assistant state has the expected volume."""
+        volume = (state.get("attributes") or {}).get("volume_level")
+        return isinstance(volume, int | float) and abs(float(volume) - expected) < 0.005
 
     async def _verified_media_player_command(
         self,
@@ -182,17 +540,11 @@ class TriadMatrixTestProvider(PlayerProvider):
         entity_id: str,
         service: str,
         service_data: dict[str, Any] | None,
-        verifier: Any,
+        verifier: Callable[[dict[str, Any]], bool],
         description: str,
         attempts: int = 5,
     ) -> dict[str, Any]:
-        """Run an HA media-player command and verify its resulting state.
-
-        The Triad HA integration intentionally swallows transient AMS protocol
-        errors at the entity layer. A successful HA service call therefore does
-        not prove that the matrix accepted the command. Verification against the
-        entity's cached state is required before the prototype proceeds.
-        """
+        """Run a Home Assistant media-player command and verify its state."""
         last_state: dict[str, Any] | None = None
         last_error: Exception | None = None
 
@@ -210,14 +562,14 @@ class TriadMatrixTestProvider(PlayerProvider):
                 if verifier(last_state):
                     if attempt > 1:
                         self.logger.info(
-                            "TRIAD TEST VERIFY: %s succeeded on attempt %d",
+                            "TRIAD VERIFY: %s succeeded on attempt %d",
                             description,
                             attempt,
                         )
                     return last_state
 
                 self.logger.warning(
-                    "TRIAD TEST VERIFY: %s not confirmed on attempt %d/%d",
+                    "TRIAD VERIFY: %s not confirmed on attempt %d/%d",
                     description,
                     attempt,
                     attempts,
@@ -226,7 +578,7 @@ class TriadMatrixTestProvider(PlayerProvider):
             except Exception as err:
                 last_error = err
                 self.logger.warning(
-                    "TRIAD TEST VERIFY: %s raised on attempt %d/%d: %s",
+                    "TRIAD VERIFY: %s raised on attempt %d/%d: %s",
                     description,
                     attempt,
                     attempts,
@@ -237,158 +589,10 @@ class TriadMatrixTestProvider(PlayerProvider):
                 await asyncio.sleep(0.35)
 
         detail = (
-            f"last_state={last_state!r}"
-            if last_state is not None
-            else f"last_error={last_error!r}"
+            f"last_state={last_state!r}" if last_state is not None else f"last_error={last_error!r}"
         )
 
         raise PlayerCommandFailed(
             f"Triad command could not be verified after {attempts} attempts: "
             f"{description}; {detail}"
         )
-
-    async def route_zone_to_bus(self, player: TriadMatrixTestPlayer) -> None:
-        """Route one Triad output to Connect 1 and verify the route."""
-        self.logger.info(
-            "TRIAD TEST ROUTE: %s (output %s) -> %s",
-            player.display_name,
-            player.output_number,
-            TRIAD_SOURCE_NAME,
-        )
-
-        await self._verified_media_player_command(
-            entity_id=player.zone_entity,
-            service="select_source",
-            service_data={"source": TRIAD_SOURCE_NAME},
-            verifier=lambda state: (
-                state.get("state") not in ("off", "unavailable", "unknown", None)
-                and (state.get("attributes") or {}).get("source")
-                == TRIAD_SOURCE_NAME
-            ),
-            description=(
-                f"route {player.display_name} output "
-                f"{player.output_number} to {TRIAD_SOURCE_NAME}"
-            ),
-        )
-
-    async def turn_off_zone(self, player: TriadMatrixTestPlayer) -> None:
-        """Disconnect exactly one Triad output and verify it is off."""
-        self.logger.info(
-            "TRIAD TEST OFF: %s (output %s)",
-            player.display_name,
-            player.output_number,
-        )
-
-        await self._verified_media_player_command(
-            entity_id=player.zone_entity,
-            service="turn_off",
-            service_data=None,
-            verifier=lambda state: state.get("state") == "off",
-            description=(
-                f"disconnect {player.display_name} output "
-                f"{player.output_number}"
-            ),
-        )
-
-    async def set_zone_volume(
-        self,
-        player: TriadMatrixTestPlayer,
-        volume_level: int,
-    ) -> None:
-        """Set one Triad output volume and verify the resulting level."""
-        expected = max(0, min(100, volume_level)) / 100
-
-        await self._verified_media_player_command(
-            entity_id=player.zone_entity,
-            service="volume_set",
-            service_data={"volume_level": expected},
-            verifier=lambda state: (
-                isinstance(
-                    (state.get("attributes") or {}).get("volume_level"),
-                    (int, float),
-                )
-                and abs(
-                    float(
-                        (state.get("attributes") or {}).get("volume_level")
-                    )
-                    - expected
-                )
-                < 0.005
-            ),
-            description=(
-                f"set {player.display_name} output "
-                f"{player.output_number} volume to {volume_level}%"
-            ),
-        )
-
-    async def set_zone_mute(
-        self,
-        player: TriadMatrixTestPlayer,
-        muted: bool,
-    ) -> None:
-        """Set one Triad output mute state and verify it."""
-        await self._verified_media_player_command(
-            entity_id=player.zone_entity,
-            service="volume_mute",
-            service_data={"is_volume_muted": muted},
-            verifier=lambda state: (
-                (state.get("attributes") or {}).get("is_volume_muted")
-                is muted
-            ),
-            description=(
-                f"set {player.display_name} output "
-                f"{player.output_number} muted={muted}"
-            ),
-        )
-
-    async def claim_bus(self, owner_id: str) -> Player:
-        """Reserve Connect 1 for one logical MA playback session."""
-        async with self._bus_lock:
-            backend = self.get_backend_player()
-            assert backend is not None
-
-            if self._bus_owner is None:
-                if backend.state.playback_state in (
-                    PlaybackState.PLAYING,
-                    PlaybackState.PAUSED,
-                ):
-                    raise PlayerCommandFailed(
-                        "Triad prototype refused to seize Connect 1 because "
-                        f"{backend.display_name} is already "
-                        f"{backend.state.playback_state.value}."
-                    )
-
-                self._bus_owner = owner_id
-
-                self.logger.info(
-                    "TRIAD TEST BUS CLAIM: %s claimed %s",
-                    owner_id,
-                    backend.display_name,
-                )
-
-            elif self._bus_owner != owner_id:
-                owner = self._players_by_id.get(self._bus_owner)
-                owner_name = (
-                    owner.display_name
-                    if owner is not None
-                    else self._bus_owner
-                )
-
-                raise PlayerCommandFailed(
-                    "Triad prototype has only one test bus. "
-                    f"Connect 1 is already owned by {owner_name}."
-                )
-
-            return backend
-
-    async def release_bus(self, owner_id: str) -> None:
-        """Release Connect 1 if owned by this logical player."""
-        async with self._bus_lock:
-            if self._bus_owner != owner_id:
-                return
-
-            self.logger.info(
-                "TRIAD TEST BUS RELEASE: %s released Connect 1",
-                owner_id,
-            )
-            self._bus_owner = None

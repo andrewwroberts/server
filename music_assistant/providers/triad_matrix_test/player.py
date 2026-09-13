@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from music_assistant_models.enums import PlaybackState, PlayerFeature
 from music_assistant_models.errors import PlayerCommandFailed
@@ -12,7 +12,7 @@ from music_assistant.controllers.players.constants import PlayerLockPurpose
 from music_assistant.models.player import Player, PlayerMedia
 
 if TYPE_CHECKING:
-    from .provider import TriadMatrixTestProvider
+    from .provider import MatrixBus, TriadMatrixTestProvider
 
 
 class TriadMatrixTestPlayer(Player):
@@ -37,7 +37,6 @@ class TriadMatrixTestPlayer(Player):
             manufacturer="Triad / Control4",
             model=f"AMS16 Output {output_number}",
         )
-
         self._attr_supported_features = {
             PlayerFeature.PLAY_MEDIA,
             PlayerFeature.PAUSE,
@@ -45,11 +44,7 @@ class TriadMatrixTestPlayer(Player):
             PlayerFeature.VOLUME_MUTE,
             PlayerFeature.SET_MEMBERS,
         }
-
-        # Every logical room belonging to this provider can group with every
-        # other logical room belonging to the same provider.
         self._attr_can_group_with = {provider.instance_id}
-
         self._attr_available = False
         self._attr_playback_state = PlaybackState.IDLE
         self._attr_volume_level = None
@@ -62,42 +57,22 @@ class TriadMatrixTestPlayer(Player):
 
     @property
     def needs_poll(self) -> bool:
-        """Poll HA for Triad volume/availability state."""
+        """Poll Home Assistant for Triad room state."""
         return True
 
     @property
     def poll_interval(self) -> int:
-        """Poll more frequently while this player owns playback."""
-        if self.provider.bus_owner == self.player_id:
+        """Poll more frequently while this player owns a source bus."""
+        if self._prov.get_bus_for_owner(self.player_id):
             return 2
         return 10
 
-    def _effective_members(self) -> list[TriadMatrixTestPlayer]:
-        """Return this leader plus its current logical room members."""
-        ids = (
-            list(self._attr_group_members)
-            if self._attr_group_members
-            else [self.player_id]
-        )
-
-        if self.player_id not in ids:
-            ids.insert(0, self.player_id)
-
-        result: list[TriadMatrixTestPlayer] = []
-
-        for player_id in ids:
-            player = self.provider.get_room_player(player_id)
-            if player is not None:
-                result.append(player)
-
-        return result
-
     async def poll(self) -> None:
-        """Refresh Triad state and mirror backend playback for the bus owner."""
+        """Refresh Triad state and mirror the reserved Sonos backend."""
         try:
-            state = await self.provider.get_zone_state(self.zone_entity)
+            state = await self._prov.get_zone_state(self.zone_entity)
         except Exception as err:
-            self.provider.logger.debug(
+            self._prov.logger.debug(
                 "Unable to poll %s: %s",
                 self.display_name,
                 err,
@@ -108,14 +83,12 @@ class TriadMatrixTestPlayer(Player):
 
         raw_state = state.get("state")
         attrs = state.get("attributes", {})
+        bus = self._prov.get_bus_for_owner(self.player_id)
+        backend = self._prov.get_backend_player(bus, required=False) if bus is not None else None
 
-        backend = self.provider.get_backend_player(required=False)
-
-        self._attr_available = (
-            raw_state not in ("unavailable", "unknown", None)
-            and backend is not None
+        self._attr_available = raw_state not in ("unavailable", "unknown", None) and (
+            backend is not None if bus is not None else self._prov.has_available_backend()
         )
-
         self._attr_powered = raw_state != "off"
 
         volume = attrs.get("volume_level")
@@ -126,11 +99,10 @@ class TriadMatrixTestPlayer(Player):
         if isinstance(muted, bool):
             self._attr_volume_muted = muted
 
-        if (
-            self.provider.bus_owner == self.player_id
-            and backend is not None
-        ):
+        if backend is not None:
             self._attr_playback_state = backend.state.playback_state
+            self._attr_elapsed_time = backend.state.elapsed_time
+            self._attr_elapsed_time_last_updated = backend.state.elapsed_time_last_updated
 
         self.update_state()
 
@@ -138,7 +110,7 @@ class TriadMatrixTestPlayer(Player):
         """Set the volume of this Triad output only."""
         volume_level = max(0, min(100, volume_level))
 
-        await self.provider.set_zone_volume(
+        await self._prov.set_zone_volume(
             self,
             volume_level,
         )
@@ -148,7 +120,7 @@ class TriadMatrixTestPlayer(Player):
 
     async def volume_mute(self, muted: bool) -> None:
         """Mute or unmute this Triad output only."""
-        await self.provider.set_zone_mute(
+        await self._prov.set_zone_mute(
             self,
             muted,
         )
@@ -157,26 +129,29 @@ class TriadMatrixTestPlayer(Player):
         self.update_state()
 
     async def play_media(self, media: PlayerMedia) -> None:
-        """Start MA playback through Connect 1 and route selected rooms."""
-        backend = await self.provider.claim_bus(self.player_id)
-
+        """Start MA playback on an available source bus."""
         members = self._effective_members()
+        bus, backend = await self._prov.claim_bus(
+            self.player_id,
+            [member.player_id for member in members],
+        )
+        routed: list[TriadMatrixTestPlayer] = []
 
-        self.provider.logger.info(
-            "TRIAD TEST PLAY: leader=%s members=%s backend=%s",
+        self._prov.logger.info(
+            "TRIAD PLAY: leader=%s members=%s bus=%s backend=%s",
             self.display_name,
             [member.display_name for member in members],
+            bus.source_name,
             backend.display_name,
         )
 
         try:
-            # Establish matrix routing first so audio is already pointed at
-            # the desired rooms when the Sonos stream begins.
-            for member in members:
-                await self.provider.route_zone_to_bus(member)
+            await self._prov.prepare_backend(bus, backend)
 
-            # This is the same internal forwarding pattern used by MA's own
-            # Sync Group / Universal Group providers.
+            for member in members:
+                await self._prov.route_zone_to_bus(member, bus)
+                routed.append(member)
+
             async with self.mass.players.get_player_lock(
                 backend.player_id,
                 PlayerLockPurpose.PLAYBACK,
@@ -187,15 +162,22 @@ class TriadMatrixTestPlayer(Player):
                 )
 
         except Exception:
-            # Never leave the prototype claiming the shared transport after
-            # a failed startup.
-            for member in members:
+            cleanup_errors = await self._cleanup_session(bus, routed)
+            if cleanup_errors:
+                self._prov.logger.error(
+                    "Triad startup cleanup retained %s for safety: %s",
+                    bus.source_name,
+                    "; ".join(cleanup_errors),
+                )
+            else:
                 try:
-                    await self.provider.turn_off_zone(member)
-                except Exception:
-                    pass
-
-            await self.provider.release_bus(self.player_id)
+                    await self._prov.release_bus(self.player_id)
+                except Exception as err:
+                    self._prov.logger.error(
+                        "Triad startup cleanup retained %s for safety: %s",
+                        bus.source_name,
+                        err,
+                    )
             raise
 
         self._attr_current_media = media
@@ -204,13 +186,9 @@ class TriadMatrixTestPlayer(Player):
         self.update_state()
 
     async def play(self) -> None:
-        """Resume playback on the shared Sonos backend."""
-        if self.provider.bus_owner != self.player_id:
-            raise PlayerCommandFailed(
-                f"{self.display_name} does not currently own Connect 1."
-            )
-
-        backend = self.provider.get_backend_player()
+        """Resume playback on the reserved Sonos backend."""
+        bus = self._get_owned_bus()
+        backend = self._prov.get_backend_player(bus)
         assert backend is not None
 
         async with self.mass.players.get_player_lock(
@@ -225,13 +203,9 @@ class TriadMatrixTestPlayer(Player):
         self.update_state()
 
     async def pause(self) -> None:
-        """Pause playback without changing any matrix routing."""
-        if self.provider.bus_owner != self.player_id:
-            raise PlayerCommandFailed(
-                f"{self.display_name} does not currently own Connect 1."
-            )
-
-        backend = self.provider.get_backend_player()
+        """Pause playback without changing matrix routing."""
+        bus = self._get_owned_bus()
+        backend = self._prov.get_backend_player(bus)
         assert backend is not None
 
         async with self.mass.players.get_player_lock(
@@ -246,50 +220,41 @@ class TriadMatrixTestPlayer(Player):
         self.update_state()
 
     async def stop(self) -> None:
-        """Stop the shared stream and turn off this logical room group."""
-        if self.provider.bus_owner != self.player_id:
-            self._attr_playback_state = PlaybackState.IDLE
-            self._attr_current_media = None
-            self.update_state()
+        """Stop and release this logical room group's source bus."""
+        bus = self._prov.get_bus_for_owner(self.player_id)
+        if bus is None:
+            self._set_idle()
             return
 
-        backend = self.provider.get_backend_player(required=False)
-
-        self.provider.logger.info(
-            "TRIAD TEST STOP: leader=%s members=%s",
+        members = self._effective_members()
+        self._prov.logger.info(
+            "TRIAD STOP: leader=%s members=%s bus=%s",
             self.display_name,
-            [member.display_name for member in self._effective_members()],
+            [member.display_name for member in members],
+            bus.source_name,
         )
 
-        if backend is not None:
-            async with self.mass.players.get_player_lock(
-                backend.player_id,
-                PlayerLockPurpose.PLAYBACK,
-            ):
-                await self.mass.players._handle_cmd_stop(
-                    backend.player_id,
-                )
+        errors = await self._cleanup_session(bus, members)
+        if errors:
+            raise PlayerCommandFailed(
+                f"Could not safely release {bus.source_name}; it remains reserved. "
+                f"{'; '.join(errors)}"
+            )
 
-        for member in self._effective_members():
-            await self.provider.turn_off_zone(member)
+        await self._prov.release_bus(self.player_id)
+        self._set_idle()
 
-        await self.provider.release_bus(self.player_id)
-
-        self._attr_playback_state = PlaybackState.IDLE
-        self._attr_current_media = None
-        self._attr_active_source = None
-        self.update_state()
+        for member in members:
+            if member is not self:
+                member.update_state()
 
     async def set_members(
         self,
         player_ids_to_add: list[str] | None = None,
         player_ids_to_remove: list[str] | None = None,
     ) -> None:
-        """Dynamically add/remove Triad rooms without restarting Sonos."""
-        current = dict.fromkeys(
-            self._attr_group_members or [self.player_id]
-        )
-
+        """Add or remove logical rooms without restarting an active stream."""
+        current = dict.fromkeys(self._attr_group_members or [self.player_id])
         added: list[TriadMatrixTestPlayer] = []
         removed: list[TriadMatrixTestPlayer] = []
 
@@ -297,20 +262,18 @@ class TriadMatrixTestPlayer(Player):
             if member_id == self.player_id:
                 continue
 
-            member = self.provider.get_room_player(member_id)
-
+            member = self._prov.get_room_player(member_id)
             if member is None:
+                raise PlayerCommandFailed(f"{member_id} is not a Triad prototype room.")
+
+            if member_bus := self._prov.get_bus_for_owner(member_id):
                 raise PlayerCommandFailed(
-                    f"{member_id} is not a Triad prototype room."
+                    f"{member.display_name} is using {member_bus.source_name} "
+                    "for an independent stream; stop it before grouping."
                 )
 
-            if (
-                member.state.synced_to
-                and member.state.synced_to != self.player_id
-            ):
-                raise PlayerCommandFailed(
-                    f"{member.display_name} is already grouped elsewhere."
-                )
+            if member.state.synced_to and member.state.synced_to != self.player_id:
+                raise PlayerCommandFailed(f"{member.display_name} is already grouped elsewhere.")
 
             if member_id not in current:
                 current[member_id] = None
@@ -320,50 +283,141 @@ class TriadMatrixTestPlayer(Player):
             if member_id == self.player_id:
                 continue
 
-            member = self.provider.get_room_player(member_id)
-
+            member = self._prov.get_room_player(member_id)
             if member_id in current:
                 current.pop(member_id, None)
 
                 if member is not None:
                     removed.append(member)
 
-        other_members = [
-            player_id
-            for player_id in current
-            if player_id != self.player_id
-        ]
+        bus = self._prov.get_bus_for_owner(self.player_id)
+        completed_added: list[TriadMatrixTestPlayer] = []
+        completed_removed: list[TriadMatrixTestPlayer] = []
 
-        self._attr_group_members = (
-            [self.player_id, *other_members]
-            if other_members
-            else []
-        )
+        if bus is not None:
+            try:
+                for member in added:
+                    await self._prov.route_zone_to_bus(member, bus)
+                    completed_added.append(member)
 
-        active = self.provider.bus_owner == self.player_id
+                for member in removed:
+                    await self._prov.turn_off_zone(member)
+                    completed_removed.append(member)
+            except Exception:
+                await self._rollback_member_changes(
+                    bus,
+                    completed_added,
+                    completed_removed,
+                )
+                raise
 
-        self.provider.logger.info(
-            "TRIAD TEST MEMBERS: leader=%s add=%s remove=%s active=%s final=%s",
+        other_members = [player_id for player_id in current if player_id != self.player_id]
+        self._attr_group_members = [self.player_id, *other_members] if other_members else []
+
+        self._prov.logger.info(
+            "TRIAD MEMBERS: leader=%s add=%s remove=%s active_bus=%s final=%s",
             self.display_name,
             [member.display_name for member in added],
             [member.display_name for member in removed],
-            active,
+            bus.source_name if bus else None,
             self._attr_group_members,
         )
 
-        # This is the key experiment:
-        #
-        # During active playback, adding a room performs ONLY a matrix route.
-        # It does not call play_media, pause, play, stop, or otherwise touch
-        # the Sonos transport.
-        if active:
-            for member in added:
-                await self.provider.route_zone_to_bus(member)
-
-            for member in removed:
-                await self.provider.turn_off_zone(member)
-
         self.update_state()
-
         for member in [*added, *removed]:
             member.update_state()
+
+    def _effective_members(self) -> list[TriadMatrixTestPlayer]:
+        """Return this leader plus its current logical room members."""
+        ids = list(self._attr_group_members) if self._attr_group_members else [self.player_id]
+        if self.player_id not in ids:
+            ids.insert(0, self.player_id)
+
+        return [
+            player
+            for player_id in ids
+            if (player := self._prov.get_room_player(player_id)) is not None
+        ]
+
+    def _get_owned_bus(self) -> MatrixBus:
+        """Return this player's reserved source bus."""
+        bus = self._prov.get_bus_for_owner(self.player_id)
+        if bus is None:
+            raise PlayerCommandFailed(
+                f"{self.display_name} does not currently own a Triad source bus."
+            )
+        return bus
+
+    async def _cleanup_session(
+        self,
+        bus: MatrixBus,
+        members: list[TriadMatrixTestPlayer],
+    ) -> list[str]:
+        """Stop a backend and disconnect the rooms attached to its session."""
+        errors: list[str] = []
+        backend = self._prov.get_backend_player(bus, required=False)
+
+        if backend is None:
+            errors.append(f"{bus.source_name} backend is unavailable")
+        else:
+            try:
+                async with self.mass.players.get_player_lock(
+                    backend.player_id,
+                    PlayerLockPurpose.PLAYBACK,
+                ):
+                    await self.mass.players._handle_cmd_stop(
+                        backend.player_id,
+                    )
+                await self._prov.wait_for_backend_idle(bus, backend)
+            except Exception as err:
+                errors.append(f"stop {bus.source_name}: {err}")
+
+        for member in members:
+            try:
+                await self._prov.turn_off_zone(member)
+            except Exception as err:
+                errors.append(f"disconnect {member.display_name}: {err}")
+
+        return errors
+
+    async def _rollback_member_changes(
+        self,
+        bus: MatrixBus,
+        added: list[TriadMatrixTestPlayer],
+        removed: list[TriadMatrixTestPlayer],
+    ) -> None:
+        """Best-effort restore the physical group after a membership error."""
+        rollback_errors: list[str] = []
+
+        for member in reversed(added):
+            try:
+                await self._prov.turn_off_zone(member)
+            except Exception as err:
+                rollback_errors.append(f"remove {member.display_name}: {err}")
+
+        for member in reversed(removed):
+            try:
+                await self._prov.route_zone_to_bus(member, bus)
+            except Exception as err:
+                rollback_errors.append(f"restore {member.display_name}: {err}")
+
+        if rollback_errors:
+            self._prov.logger.error(
+                "Triad membership rollback was incomplete on %s: %s",
+                bus.source_name,
+                "; ".join(rollback_errors),
+            )
+
+    def _set_idle(self) -> None:
+        """Reset local playback state after a successful stop."""
+        self._attr_playback_state = PlaybackState.IDLE
+        self._attr_current_media = None
+        self._attr_active_source = None
+        self._attr_elapsed_time = None
+        self._attr_elapsed_time_last_updated = None
+        self.update_state()
+
+    @property
+    def _prov(self) -> TriadMatrixTestProvider:
+        """Return the typed Triad provider."""
+        return cast("TriadMatrixTestProvider", self.provider)
