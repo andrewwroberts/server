@@ -176,8 +176,79 @@ class TriadMatrixTestProvider(PlayerProvider):
 
         return states[0]
 
+    async def _verified_media_player_command(
+        self,
+        *,
+        entity_id: str,
+        service: str,
+        service_data: dict[str, Any] | None,
+        verifier: Any,
+        description: str,
+        attempts: int = 5,
+    ) -> dict[str, Any]:
+        """Run an HA media-player command and verify its resulting state.
+
+        The Triad HA integration intentionally swallows transient AMS protocol
+        errors at the entity layer. A successful HA service call therefore does
+        not prove that the matrix accepted the command. Verification against the
+        entity's cached state is required before the prototype proceeds.
+        """
+        last_state: dict[str, Any] | None = None
+        last_error: Exception | None = None
+
+        for attempt in range(1, attempts + 1):
+            try:
+                await self.call_media_player_service(
+                    entity_id,
+                    service,
+                    service_data,
+                )
+                await asyncio.sleep(0.35)
+
+                last_state = await self.get_zone_state(entity_id)
+
+                if verifier(last_state):
+                    if attempt > 1:
+                        self.logger.info(
+                            "TRIAD TEST VERIFY: %s succeeded on attempt %d",
+                            description,
+                            attempt,
+                        )
+                    return last_state
+
+                self.logger.warning(
+                    "TRIAD TEST VERIFY: %s not confirmed on attempt %d/%d",
+                    description,
+                    attempt,
+                    attempts,
+                )
+
+            except Exception as err:
+                last_error = err
+                self.logger.warning(
+                    "TRIAD TEST VERIFY: %s raised on attempt %d/%d: %s",
+                    description,
+                    attempt,
+                    attempts,
+                    err,
+                )
+
+            if attempt < attempts:
+                await asyncio.sleep(0.35)
+
+        detail = (
+            f"last_state={last_state!r}"
+            if last_state is not None
+            else f"last_error={last_error!r}"
+        )
+
+        raise PlayerCommandFailed(
+            f"Triad command could not be verified after {attempts} attempts: "
+            f"{description}; {detail}"
+        )
+
     async def route_zone_to_bus(self, player: TriadMatrixTestPlayer) -> None:
-        """Route one Triad output to Connect 1 / input 3."""
+        """Route one Triad output to Connect 1 and verify the route."""
         self.logger.info(
             "TRIAD TEST ROUTE: %s (output %s) -> %s",
             player.display_name,
@@ -185,32 +256,89 @@ class TriadMatrixTestProvider(PlayerProvider):
             TRIAD_SOURCE_NAME,
         )
 
-        # This intentionally matches the sequence already proven in Andrew's
-        # Home Assistant routing scripts:
-        #   1. turn the Triad output on
-        #   2. select "Connect 1"
-        await self.call_media_player_service(
-            player.zone_entity,
-            "turn_on",
-        )
-
-        await self.call_media_player_service(
-            player.zone_entity,
-            "select_source",
-            {"source": TRIAD_SOURCE_NAME},
+        await self._verified_media_player_command(
+            entity_id=player.zone_entity,
+            service="select_source",
+            service_data={"source": TRIAD_SOURCE_NAME},
+            verifier=lambda state: (
+                state.get("state") not in ("off", "unavailable", "unknown", None)
+                and (state.get("attributes") or {}).get("source")
+                == TRIAD_SOURCE_NAME
+            ),
+            description=(
+                f"route {player.display_name} output "
+                f"{player.output_number} to {TRIAD_SOURCE_NAME}"
+            ),
         )
 
     async def turn_off_zone(self, player: TriadMatrixTestPlayer) -> None:
-        """Turn off exactly one Triad output."""
+        """Disconnect exactly one Triad output and verify it is off."""
         self.logger.info(
             "TRIAD TEST OFF: %s (output %s)",
             player.display_name,
             player.output_number,
         )
 
-        await self.call_media_player_service(
-            player.zone_entity,
-            "turn_off",
+        await self._verified_media_player_command(
+            entity_id=player.zone_entity,
+            service="turn_off",
+            service_data=None,
+            verifier=lambda state: state.get("state") == "off",
+            description=(
+                f"disconnect {player.display_name} output "
+                f"{player.output_number}"
+            ),
+        )
+
+    async def set_zone_volume(
+        self,
+        player: TriadMatrixTestPlayer,
+        volume_level: int,
+    ) -> None:
+        """Set one Triad output volume and verify the resulting level."""
+        expected = max(0, min(100, volume_level)) / 100
+
+        await self._verified_media_player_command(
+            entity_id=player.zone_entity,
+            service="volume_set",
+            service_data={"volume_level": expected},
+            verifier=lambda state: (
+                isinstance(
+                    (state.get("attributes") or {}).get("volume_level"),
+                    (int, float),
+                )
+                and abs(
+                    float(
+                        (state.get("attributes") or {}).get("volume_level")
+                    )
+                    - expected
+                )
+                < 0.005
+            ),
+            description=(
+                f"set {player.display_name} output "
+                f"{player.output_number} volume to {volume_level}%"
+            ),
+        )
+
+    async def set_zone_mute(
+        self,
+        player: TriadMatrixTestPlayer,
+        muted: bool,
+    ) -> None:
+        """Set one Triad output mute state and verify it."""
+        await self._verified_media_player_command(
+            entity_id=player.zone_entity,
+            service="volume_mute",
+            service_data={"is_volume_muted": muted},
+            verifier=lambda state: (
+                (state.get("attributes") or {}).get("is_volume_muted")
+                is muted
+            ),
+            description=(
+                f"set {player.display_name} output "
+                f"{player.output_number} muted={muted}"
+            ),
         )
 
     async def claim_bus(self, owner_id: str) -> Player:

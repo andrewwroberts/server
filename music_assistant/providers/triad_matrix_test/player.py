@@ -138,10 +138,9 @@ class TriadMatrixTestPlayer(Player):
         """Set the volume of this Triad output only."""
         volume_level = max(0, min(100, volume_level))
 
-        await self.provider.call_media_player_service(
-            self.zone_entity,
-            "volume_set",
-            {"volume_level": volume_level / 100},
+        await self.provider.set_zone_volume(
+            self,
+            volume_level,
         )
 
         self._attr_volume_level = volume_level
@@ -149,10 +148,9 @@ class TriadMatrixTestPlayer(Player):
 
     async def volume_mute(self, muted: bool) -> None:
         """Mute or unmute this Triad output only."""
-        await self.provider.call_media_player_service(
-            self.zone_entity,
-            "volume_mute",
-            {"is_volume_muted": muted},
+        await self.provider.set_zone_mute(
+            self,
+            muted,
         )
 
         self._attr_volume_muted = muted
