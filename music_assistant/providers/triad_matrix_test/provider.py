@@ -26,17 +26,17 @@ if TYPE_CHECKING:
 BACKEND_PLAYER_ID = "RINCON_B8E937997EE801400"
 TRIAD_SOURCE_NAME = "Connect 1"
 
-# Deliberately only two rooms for the first experiment.
+# Deliberately only two low-disruption rooms for the first experiment.
 ROOMS = {
-    "triad_test_kitchen": {
-        "name": "Triad Test - Kitchen",
-        "entity_id": "media_player.triad_kitchen",
-        "output": 4,
+    "triad_test_master_bedroom": {
+        "name": "Triad Test - Master Bedroom",
+        "entity_id": "media_player.triad_master_bedroom",
+        "output": 3,
     },
-    "triad_test_dining_room": {
-        "name": "Triad Test - Dining Room",
-        "entity_id": "media_player.triad_dining_room",
-        "output": 6,
+    "triad_test_master_bath": {
+        "name": "Triad Test - Master Bath",
+        "entity_id": "media_player.triad_master_bath",
+        "output": 2,
     },
 }
 

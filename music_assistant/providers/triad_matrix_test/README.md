@@ -9,19 +9,19 @@ whole-house audio system.
   - MA player ID: `RINCON_B8E937997EE801400`
   - Home Assistant: `media_player.connect_1`
   - Triad input: 3
-- Kitchen
-  - Home Assistant: `media_player.triad_kitchen`
-  - Triad output: 4
-- Dining Room
-  - Home Assistant: `media_player.triad_dining_room`
-  - Triad output: 6
+- Master Bedroom
+  - Home Assistant: `media_player.triad_master_bedroom`
+  - Triad output: 3
+- Master Bath
+  - Home Assistant: `media_player.triad_master_bath`
+  - Triad output: 2
 
 The provider uses the source name `Connect 1`, matching the working Home
 Assistant Triad routing configuration.
 
 ## Goal
 
-Music Assistant exposes Kitchen and Dining Room as room players.
+Music Assistant exposes Master Bedroom and Master Bath as room players.
 
 Playback started on one room claims Connect 1. A grouped room is routed to
 the same Triad input.
