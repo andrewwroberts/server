@@ -379,6 +379,116 @@ class TriadMatrixTestProvider(PlayerProvider):
         bus.owner_id = None
         return True
 
+    async def reconcile_idle_room_route(self, player_id: str) -> bool:
+        """Reclaim an orphaned physical route when an explicit command needs the room."""
+        player = self.get_room_player(player_id)
+        if player is None:
+            return False
+
+        async with self._bus_lock:
+            state = await self.get_zone_state(player.zone_entity)
+            source = (state.get("attributes") or {}).get("source")
+
+            bus = next(
+                (candidate for candidate in self._buses if candidate.source_name == source),
+                None,
+            )
+            if bus is None:
+                return source is None
+
+            if bus.owner_id is not None:
+                return await self._reconcile_idle_bus_owner_locked(bus.owner_id)
+
+            return await self._reconcile_ownerless_idle_bus_locked(bus)
+
+    async def _reconcile_ownerless_idle_bus_locked(
+        self,
+        bus: MatrixBus,
+        states: dict[str, Any] | None = None,
+    ) -> bool:
+        """Disconnect an idle physical bus route that has no logical owner."""
+        if bus.owner_id is not None:
+            return False
+
+        backend = self.get_backend_player(bus, required=False)
+        if backend is None or backend.state.playback_state != PlaybackState.IDLE:
+            return False
+
+        zone_entities = [player.zone_entity for player in self._players_by_id.values()]
+        if states is None:
+            states = await self._get_zone_states(zone_entities)
+
+        if missing := set(zone_entities) - states.keys():
+            self.logger.warning(
+                "TRIAD OWNERLESS BUS RECLAIM REFUSED: %s; missing room states=%s",
+                bus.source_name,
+                ", ".join(sorted(missing)),
+            )
+            return False
+
+        routed_players = [
+            player
+            for player in self._players_by_id.values()
+            if (states.get(player.zone_entity, {}).get("attributes") or {}).get("source")
+            == bus.source_name
+        ]
+
+        if not routed_players:
+            return True
+
+        non_idle_players = [
+            player
+            for player in routed_players
+            if player.state.playback_state != PlaybackState.IDLE
+        ]
+        if non_idle_players:
+            self.logger.warning(
+                "TRIAD OWNERLESS BUS RECLAIM REFUSED: %s has non-idle routed rooms=%s",
+                bus.source_name,
+                [
+                    f"{player.display_name}={player.state.playback_state.value}"
+                    for player in non_idle_players
+                ],
+            )
+            return False
+
+        grouped_players = [
+            player
+            for player in routed_players
+            if player.state.synced_to
+        ]
+        if grouped_players:
+            self.logger.warning(
+                "TRIAD OWNERLESS BUS RECLAIM REFUSED: %s has grouped rooms=%s",
+                bus.source_name,
+                [
+                    f"{player.display_name}->{player.state.synced_to}"
+                    for player in grouped_players
+                ],
+            )
+            return False
+
+        disconnected: list[str] = []
+        for player in routed_players:
+            try:
+                await self.turn_off_zone(player)
+                disconnected.append(player.display_name)
+            except Exception as err:
+                self.logger.warning(
+                    "TRIAD OWNERLESS BUS RECLAIM FAILED: %s while disconnecting %s: %s",
+                    bus.source_name,
+                    player.display_name,
+                    err,
+                )
+                return False
+
+        self.logger.info(
+            "TRIAD OWNERLESS BUS RECLAIM: %s disconnected=%s",
+            bus.source_name,
+            disconnected,
+        )
+        return True
+
     async def claim_bus(
         self,
         owner_id: str,
@@ -443,10 +553,31 @@ class TriadMatrixTestProvider(PlayerProvider):
                     == bus.source_name
                 ]
                 if routed_elsewhere:
-                    busy.append(
-                        f"{bus.source_name} is already routed to {', '.join(routed_elsewhere)}"
-                    )
-                    continue
+                    if await self._reconcile_ownerless_idle_bus_locked(bus, states):
+                        states = await self._get_zone_states(zone_entities)
+                        if missing := set(zone_entities) - states.keys():
+                            raise PlayerCommandFailed(
+                                "Home Assistant did not return every Triad room state "
+                                "after ownerless-bus reclamation; no source bus was claimed. "
+                                f"Missing: {', '.join(sorted(missing))}."
+                            )
+
+                        routed_elsewhere = [
+                            player.display_name
+                            for player_id, player in self._players_by_id.items()
+                            if player_id not in requested_members
+                            and (
+                                states.get(player.zone_entity, {}).get("attributes") or {}
+                            ).get("source")
+                            == bus.source_name
+                        ]
+
+                    if routed_elsewhere:
+                        busy.append(
+                            f"{bus.source_name} is already routed to "
+                            f"{', '.join(routed_elsewhere)}"
+                        )
+                        continue
 
                 bus.owner_id = owner_id
                 self.logger.info(
