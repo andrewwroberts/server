@@ -267,10 +267,12 @@ class TriadMatrixTestPlayer(Player):
                 raise PlayerCommandFailed(f"{member_id} is not a Triad prototype room.")
 
             if member_bus := self._prov.get_bus_for_owner(member_id):
-                raise PlayerCommandFailed(
-                    f"{member.display_name} is using {member_bus.source_name} "
-                    "for an independent stream; stop it before grouping."
-                )
+                reclaimed = await self._prov.reconcile_idle_bus_owner(member_id)
+                if not reclaimed:
+                    raise PlayerCommandFailed(
+                        f"{member.display_name} is using {member_bus.source_name} "
+                        "for an independent stream; stop it before grouping."
+                    )
 
             if member.state.synced_to and member.state.synced_to != self.player_id:
                 raise PlayerCommandFailed(f"{member.display_name} is already grouped elsewhere.")
