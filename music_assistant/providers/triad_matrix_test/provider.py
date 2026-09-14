@@ -278,6 +278,52 @@ class TriadMatrixTestProvider(PlayerProvider):
 
         return states[entity_id]
 
+    async def _prepare_backend_for_reclaim(
+        self,
+        bus: MatrixBus,
+        backend: Player,
+    ) -> bool:
+        """Stop a stale paused backend after logical-session safety checks pass."""
+        playback_state = backend.state.playback_state
+
+        if playback_state == PlaybackState.IDLE:
+            return True
+
+        if playback_state != PlaybackState.PAUSED:
+            self.logger.warning(
+                "TRIAD BACKEND RECLAIM REFUSED: %s backend=%s state=%s",
+                bus.source_name,
+                backend.display_name,
+                playback_state.value,
+            )
+            return False
+
+        self.logger.info(
+            "TRIAD STALE BACKEND STOP: %s backend=%s",
+            bus.source_name,
+            backend.display_name,
+        )
+
+        try:
+            async with self.mass.players.get_player_lock(
+                backend.player_id,
+                PlayerLockPurpose.PLAYBACK,
+            ):
+                await self.mass.players._handle_cmd_stop(
+                    backend.player_id,
+                )
+            await self.wait_for_backend_idle(bus, backend)
+        except Exception as err:
+            self.logger.warning(
+                "TRIAD STALE BACKEND STOP FAILED: %s backend=%s: %s",
+                bus.source_name,
+                backend.display_name,
+                err,
+            )
+            return False
+
+        return True
+
     async def reconcile_idle_bus_owner(self, owner_id: str) -> bool:
         """Reclaim an orphaned bus only when an explicit command needs it."""
         async with self._bus_lock:
@@ -296,9 +342,6 @@ class TriadMatrixTestProvider(PlayerProvider):
             return False
 
         if owner.state.playback_state != PlaybackState.IDLE:
-            return False
-
-        if backend.state.playback_state != PlaybackState.IDLE:
             return False
 
         zone_entities = [player.zone_entity for player in self._players_by_id.values()]
@@ -353,6 +396,9 @@ class TriadMatrixTestProvider(PlayerProvider):
                     for player in non_idle_players
                 ],
             )
+            return False
+
+        if not await self._prepare_backend_for_reclaim(bus, backend):
             return False
 
         disconnected: list[str] = []
@@ -411,7 +457,7 @@ class TriadMatrixTestProvider(PlayerProvider):
             return False
 
         backend = self.get_backend_player(bus, required=False)
-        if backend is None or backend.state.playback_state != PlaybackState.IDLE:
+        if backend is None:
             return False
 
         zone_entities = [player.zone_entity for player in self._players_by_id.values()]
@@ -466,6 +512,9 @@ class TriadMatrixTestProvider(PlayerProvider):
                     for player in grouped_players
                 ],
             )
+            return False
+
+        if not await self._prepare_backend_for_reclaim(bus, backend):
             return False
 
         disconnected: list[str] = []
