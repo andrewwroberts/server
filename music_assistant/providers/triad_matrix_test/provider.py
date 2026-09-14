@@ -74,67 +74,67 @@ BUS_DEFINITIONS = (
 
 ROOMS: dict[str, RoomDefinition] = {
     "triad_test_master_shower": {
-        "name": "Triad Test - Master Shower",
+        "name": "Master Shower",
         "entity_id": "media_player.triad_master_shower",
         "output": 1,
     },
     "triad_test_master_bath": {
-        "name": "Triad Test - Master Bath",
+        "name": "Master Bath",
         "entity_id": "media_player.triad_master_bath",
         "output": 2,
     },
     "triad_test_master_bedroom": {
-        "name": "Triad Test - Master Bedroom",
+        "name": "Master Bedroom",
         "entity_id": "media_player.triad_master_bedroom",
         "output": 3,
     },
     "triad_test_kitchen": {
-        "name": "Triad Test - Kitchen",
+        "name": "Kitchen",
         "entity_id": "media_player.triad_kitchen",
         "output": 4,
     },
     "triad_test_family_room": {
-        "name": "Triad Test - Family Room",
+        "name": "Family Room",
         "entity_id": "media_player.triad_family_room",
         "output": 5,
     },
     "triad_test_dining_room": {
-        "name": "Triad Test - Dining Room",
+        "name": "Dining Room",
         "entity_id": "media_player.triad_dining_room",
         "output": 6,
     },
     "triad_test_library": {
-        "name": "Triad Test - Library",
+        "name": "Library",
         "entity_id": "media_player.triad_library",
         "output": 7,
     },
     "triad_test_breakfast_room": {
-        "name": "Triad Test - Breakfast Room",
+        "name": "Breakfast Room",
         "entity_id": "media_player.triad_breakfast_room",
         "output": 8,
     },
     "triad_test_theater_room": {
-        "name": "Triad Test - Theater Room",
+        "name": "Theater Room",
         "entity_id": "media_player.triad_theater_room",
         "output": 9,
     },
     "triad_test_outdoor_eating_area": {
-        "name": "Triad Test - Outdoor Eating Area",
+        "name": "Outdoor Eating Area",
         "entity_id": "media_player.triad_outdoor_eating_area",
         "output": 10,
     },
     "triad_test_fire_pit": {
-        "name": "Triad Test - Fire Pit",
+        "name": "Fire Pit",
         "entity_id": "media_player.triad_fire_pit",
         "output": 11,
     },
     "triad_test_basement_weight_room": {
-        "name": "Triad Test - Basement Weight Room",
+        "name": "Basement Weight Room",
         "entity_id": "media_player.triad_basement_weight_room",
         "output": 12,
     },
     "triad_test_basement_rec_room": {
-        "name": "Triad Test - Basement Rec Room",
+        "name": "Basement Rec Room",
         "entity_id": "media_player.triad_basement_rec_room",
         "output": 13,
     },

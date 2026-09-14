@@ -2,7 +2,7 @@
   "type": "player",
   "domain": "triad_matrix_test",
   "stage": "experimental",
-  "name": "Triad Matrix Prototype",
+  "name": "Triad Matrix",
   "description": "Experimental Music Assistant player provider for a Triad AMS matrix using two automatically allocated Sonos Connect transports.",
   "codeowners": ["@andrewwroberts"],
   "requirements": [],
