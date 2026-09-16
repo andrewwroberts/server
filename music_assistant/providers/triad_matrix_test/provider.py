@@ -562,7 +562,6 @@ class TriadMatrixTestProvider(PlayerProvider):
                     "Home Assistant did not return every Triad room state; "
                     f"no source bus was claimed. Missing: {', '.join(sorted(missing))}."
                 )
-            requested_members = set(member_ids)
             unavailable: list[str] = []
             busy: list[str] = []
 
@@ -588,20 +587,14 @@ class TriadMatrixTestProvider(PlayerProvider):
                     unavailable.append(f"{bus.source_name} is unavailable")
                     continue
 
-                if backend.state.playback_state != PlaybackState.IDLE:
-                    busy.append(
-                        f"{bus.source_name} is already {backend.state.playback_state.value}"
-                    )
-                    continue
-
-                routed_elsewhere = [
-                    player.display_name
-                    for player_id, player in self._players_by_id.items()
-                    if player_id not in requested_members
-                    and (states.get(player.zone_entity, {}).get("attributes") or {}).get("source")
+                routed_players = [
+                    player
+                    for player in self._players_by_id.values()
+                    if (states.get(player.zone_entity, {}).get("attributes") or {}).get("source")
                     == bus.source_name
                 ]
-                if routed_elsewhere:
+
+                if routed_players:
                     if await self._reconcile_ownerless_idle_bus_locked(bus, states):
                         states = await self._get_zone_states(zone_entities)
                         if missing := set(zone_entities) - states.keys():
@@ -611,22 +604,27 @@ class TriadMatrixTestProvider(PlayerProvider):
                                 f"Missing: {', '.join(sorted(missing))}."
                             )
 
-                        routed_elsewhere = [
-                            player.display_name
-                            for player_id, player in self._players_by_id.items()
-                            if player_id not in requested_members
-                            and (
+                        routed_players = [
+                            player
+                            for player in self._players_by_id.values()
+                            if (
                                 states.get(player.zone_entity, {}).get("attributes") or {}
                             ).get("source")
                             == bus.source_name
                         ]
 
-                    if routed_elsewhere:
+                    if routed_players:
                         busy.append(
                             f"{bus.source_name} is already routed to "
-                            f"{', '.join(routed_elsewhere)}"
+                            f"{', '.join(player.display_name for player in routed_players)}"
                         )
                         continue
+
+                if backend.state.playback_state != PlaybackState.IDLE:
+                    busy.append(
+                        f"{bus.source_name} is already {backend.state.playback_state.value}"
+                    )
+                    continue
 
                 bus.owner_id = owner_id
                 self.logger.info(

@@ -100,7 +100,21 @@ class TriadMatrixTestPlayer(Player):
             self._attr_volume_muted = muted
 
         if backend is not None:
-            self._attr_playback_state = backend.state.playback_state
+            backend_playback_state = backend.state.playback_state
+            queue = self.mass.player_queues.get(self.player_id)
+            media_belongs_to_queue = (
+                self._attr_current_media is not None
+                and self._attr_current_media.source_id == self.player_id
+            )
+            if (
+                backend_playback_state == PlaybackState.PAUSED
+                and queue is not None
+                and queue.ended
+                and media_belongs_to_queue
+            ):
+                backend_playback_state = PlaybackState.IDLE
+
+            self._attr_playback_state = backend_playback_state
             self._attr_elapsed_time = backend.state.elapsed_time
             self._attr_elapsed_time_last_updated = backend.state.elapsed_time_last_updated
 
