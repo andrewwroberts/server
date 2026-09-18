@@ -626,10 +626,12 @@ async def test_release_requires_clear_matrix_routes() -> None:
 async def _poll_playback_state(
     backend_state: PlaybackState,
     *,
-    queue_ended: bool,
+    queue_ended: bool = False,
+    flow_exhausted: bool = False,
+    intentional_pause: bool = False,
     media_source_id: str | None,
 ) -> PlaybackState:
-    """Poll one logical room against a controlled backend/queue state."""
+    """Poll one logical room against controlled backend/queue lifecycle state."""
     provider = _provider((backend_state, PlaybackState.PLAYING))
     player_id = next(iter(ROOMS))
     room = ROOMS[player_id]
@@ -642,10 +644,20 @@ async def _poll_playback_state(
     backend.state.elapsed_time = None
     backend.state.elapsed_time_last_updated = None
 
+    session_id = "test-session"
+    queue = SimpleNamespace(ended=queue_ended)
+    queue_data = SimpleNamespace(session_id=session_id)
+
     provider.mass.player_queues = SimpleNamespace(
-        get=lambda queue_id: SimpleNamespace(ended=queue_ended)
-        if queue_id == player_id
-        else None
+        get=lambda queue_id: queue if queue_id == player_id else None,
+        queue_data_or_none=lambda queue_id: (
+            queue_data if queue_id == player_id else None
+        ),
+        flow_queue_exhausted=lambda queue_id, candidate_session_id: (
+            flow_exhausted
+            and queue_id == player_id
+            and candidate_session_id == session_id
+        ),
     )
     provider.get_zone_state = AsyncMock(  # type: ignore[method-assign]
         return_value={
@@ -660,6 +672,10 @@ async def _poll_playback_state(
     player.mass = provider.mass
     player._player_id = player_id
     player.zone_entity = str(room["entity_id"])
+    player._intentional_pause = intentional_pause
+    player._attr_playback_state = (
+        PlaybackState.PAUSED if intentional_pause else PlaybackState.PLAYING
+    )
     player._attr_current_media = (
         SimpleNamespace(source_id=media_source_id) if media_source_id is not None else None
     )
@@ -670,7 +686,7 @@ async def _poll_playback_state(
 
 
 async def test_poll_treats_ended_queue_paused_backend_as_idle() -> None:
-    """An ended MA queue must stay logically idle if Sonos lingers paused."""
+    """A persisted ended queue must stay logically idle if Sonos lingers paused."""
     player_id = next(iter(ROOMS))
 
     state = await _poll_playback_state(
@@ -682,26 +698,78 @@ async def test_poll_treats_ended_queue_paused_backend_as_idle() -> None:
     assert state == PlaybackState.IDLE
 
 
-async def test_poll_preserves_intentional_pause_for_active_queue() -> None:
-    """A real paused queue must remain logically paused."""
+async def test_poll_treats_exhausted_flow_paused_backend_as_idle() -> None:
+    """Flow exhaustion must break the paused-backend end-of-queue deadlock."""
     player_id = next(iter(ROOMS))
 
     state = await _poll_playback_state(
         PlaybackState.PAUSED,
-        queue_ended=False,
+        flow_exhausted=True,
+        media_source_id=player_id,
+    )
+
+    assert state == PlaybackState.IDLE
+
+
+async def test_poll_preserves_pre_end_backend_pause() -> None:
+    """A paused backend before flow exhaustion must not be guessed to have ended."""
+    player_id = next(iter(ROOMS))
+
+    state = await _poll_playback_state(
+        PlaybackState.PAUSED,
         media_source_id=player_id,
     )
 
     assert state == PlaybackState.PAUSED
 
 
-async def test_poll_preserves_playing_backend_for_ended_queue() -> None:
-    """An ended marker must never hide a backend that is still playing."""
+async def test_poll_preserves_intentional_pause_for_active_queue() -> None:
+    """An explicit user pause must remain logically paused."""
+    player_id = next(iter(ROOMS))
+
+    state = await _poll_playback_state(
+        PlaybackState.PAUSED,
+        intentional_pause=True,
+        media_source_id=player_id,
+    )
+
+    assert state == PlaybackState.PAUSED
+
+
+async def test_poll_preserves_intentional_pause_for_exhausted_flow() -> None:
+    """Flow exhaustion must never override an explicit user pause."""
+    player_id = next(iter(ROOMS))
+
+    state = await _poll_playback_state(
+        PlaybackState.PAUSED,
+        flow_exhausted=True,
+        intentional_pause=True,
+        media_source_id=player_id,
+    )
+
+    assert state == PlaybackState.PAUSED
+
+
+async def test_poll_preserves_intentional_pause_if_backend_reports_idle() -> None:
+    """A transient backend idle report must not release an explicit pause."""
+    player_id = next(iter(ROOMS))
+
+    state = await _poll_playback_state(
+        PlaybackState.IDLE,
+        intentional_pause=True,
+        media_source_id=player_id,
+    )
+
+    assert state == PlaybackState.PAUSED
+
+
+async def test_poll_preserves_playing_backend_for_exhausted_flow() -> None:
+    """Flow exhaustion must not hide audio the backend still reports as playing."""
     player_id = next(iter(ROOMS))
 
     state = await _poll_playback_state(
         PlaybackState.PLAYING,
-        queue_ended=True,
+        flow_exhausted=True,
         media_source_id=player_id,
     )
 
@@ -709,10 +777,11 @@ async def test_poll_preserves_playing_backend_for_ended_queue() -> None:
 
 
 async def test_poll_preserves_paused_unrelated_media() -> None:
-    """An old ended queue must not mask paused media from another source."""
+    """Queue lifecycle state must not mask paused media from another source."""
     state = await _poll_playback_state(
         PlaybackState.PAUSED,
         queue_ended=True,
+        flow_exhausted=True,
         media_source_id="some_other_source",
     )
 

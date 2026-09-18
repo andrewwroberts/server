@@ -49,6 +49,7 @@ class TriadMatrixTestPlayer(Player):
         self._attr_playback_state = PlaybackState.IDLE
         self._attr_volume_level = None
         self._attr_volume_muted = None
+        self._intentional_pause = False
 
     @property
     def requires_flow_mode(self) -> bool:
@@ -102,17 +103,38 @@ class TriadMatrixTestPlayer(Player):
         if backend is not None:
             backend_playback_state = backend.state.playback_state
             queue = self.mass.player_queues.get(self.player_id)
+            queue_data = self.mass.player_queues.queue_data_or_none(self.player_id)
             media_belongs_to_queue = (
                 self._attr_current_media is not None
                 and self._attr_current_media.source_id == self.player_id
             )
-            if (
+            flow_exhausted = bool(
+                queue_data is not None
+                and queue_data.session_id is not None
+                and self.mass.player_queues.flow_queue_exhausted(
+                    self.player_id,
+                    queue_data.session_id,
+                )
+            )
+
+            if backend_playback_state == PlaybackState.PLAYING:
+                self._intentional_pause = False
+            elif (
                 backend_playback_state == PlaybackState.PAUSED
                 and queue is not None
-                and queue.ended
                 and media_belongs_to_queue
+                and (
+                    queue.ended
+                    or (flow_exhausted and not self._intentional_pause)
+                )
             ):
                 backend_playback_state = PlaybackState.IDLE
+            elif (
+                self._intentional_pause
+                and backend_playback_state
+                in (PlaybackState.IDLE, PlaybackState.PAUSED)
+            ):
+                backend_playback_state = PlaybackState.PAUSED
 
             self._attr_playback_state = backend_playback_state
             self._attr_elapsed_time = backend.state.elapsed_time
@@ -144,6 +166,7 @@ class TriadMatrixTestPlayer(Player):
 
     async def play_media(self, media: PlayerMedia) -> None:
         """Start MA playback on an available source bus."""
+        self._intentional_pause = False
         members = self._effective_members()
         bus, backend = await self._prov.claim_bus(
             self.player_id,
@@ -213,6 +236,7 @@ class TriadMatrixTestPlayer(Player):
                 backend.player_id,
             )
 
+        self._intentional_pause = False
         self._attr_playback_state = PlaybackState.PLAYING
         self.update_state()
 
@@ -230,6 +254,7 @@ class TriadMatrixTestPlayer(Player):
                 backend.player_id,
             )
 
+        self._intentional_pause = True
         self._attr_playback_state = PlaybackState.PAUSED
         self.update_state()
 
@@ -426,6 +451,7 @@ class TriadMatrixTestPlayer(Player):
 
     def _set_idle(self) -> None:
         """Reset local playback state after a successful stop."""
+        self._intentional_pause = False
         self._attr_playback_state = PlaybackState.IDLE
         self._attr_current_media = None
         self._attr_active_source = None
