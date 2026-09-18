@@ -528,6 +528,11 @@ class Player(ABC):
         return PlayerFeature.ENQUEUE not in self.supported_features
 
     @property
+    def auto_stop_paused_queue(self) -> bool:
+        """Return whether MA should automatically stop this queue after a long pause."""
+        return True
+
+    @property
     def device_info(self) -> DeviceInfo:
         """Return the device info of the player."""
         return self._attr_device_info

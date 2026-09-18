@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, cast
 
-from music_assistant_models.enums import PlaybackState, PlayerFeature
+from music_assistant_models.enums import MediaType, PlaybackState, PlayerFeature
 from music_assistant_models.errors import PlayerCommandFailed
 from music_assistant_models.player import DeviceInfo
 
@@ -57,6 +57,11 @@ class TriadMatrixTestPlayer(Player):
         return True
 
     @property
+    def auto_stop_paused_queue(self) -> bool:
+        """Keep a deliberately paused Triad session and its reserved bus alive."""
+        return False
+
+    @property
     def needs_poll(self) -> bool:
         """Poll Home Assistant for Triad room state."""
         return True
@@ -104,6 +109,50 @@ class TriadMatrixTestPlayer(Player):
             backend_playback_state = backend.state.playback_state
             queue = self.mass.player_queues.get(self.player_id)
             queue_data = self.mass.player_queues.queue_data_or_none(self.player_id)
+
+            # The hidden Sonos backend only transports the audio. The logical Triad
+            # room's Now Playing metadata must follow its MA queue, otherwise the
+            # first PlayerMedia object remains stuck while later tracks play.
+            queue_active = bool(
+                queue is not None and getattr(queue, "active", False)
+            )
+            queue_current_item = (
+                getattr(queue, "current_item", None) if queue is not None else None
+            )
+
+            if queue_active and queue_current_item is not None:
+                current_queue_item_id = (
+                    self._attr_current_media.queue_item_id
+                    if self._attr_current_media is not None
+                    else None
+                )
+                if current_queue_item_id != queue_current_item.queue_item_id:
+                    try:
+                        self._attr_current_media = (
+                            await self.mass.player_queues.player_media_from_queue_item(
+                                queue_current_item
+                            )
+                        )
+                    except Exception as err:
+                        self._prov.logger.debug(
+                            "Unable to refresh Now Playing metadata for %s: %s",
+                            self.display_name,
+                            err,
+                        )
+
+                queue_elapsed = getattr(queue, "corrected_elapsed_time", None)
+                if (
+                    self._attr_current_media is not None
+                    and self._attr_current_media.source_id == self.player_id
+                    and queue_elapsed is not None
+                ):
+                    self._attr_current_media.elapsed_time = int(queue_elapsed)
+                    self._attr_current_media.elapsed_time_last_updated = getattr(
+                        queue,
+                        "elapsed_time_last_updated",
+                        None,
+                    )
+
             media_belongs_to_queue = (
                 self._attr_current_media is not None
                 and self._attr_current_media.source_id == self.player_id
@@ -137,8 +186,22 @@ class TriadMatrixTestPlayer(Player):
                 backend_playback_state = PlaybackState.PAUSED
 
             self._attr_playback_state = backend_playback_state
-            self._attr_elapsed_time = backend.state.elapsed_time
-            self._attr_elapsed_time_last_updated = backend.state.elapsed_time_last_updated
+            if queue_active and media_belongs_to_queue:
+                self._attr_elapsed_time = getattr(
+                    queue,
+                    "corrected_elapsed_time",
+                    None,
+                )
+                self._attr_elapsed_time_last_updated = getattr(
+                    queue,
+                    "elapsed_time_last_updated",
+                    None,
+                )
+            else:
+                self._attr_elapsed_time = backend.state.elapsed_time
+                self._attr_elapsed_time_last_updated = (
+                    backend.state.elapsed_time_last_updated
+                )
 
         self.update_state()
 
@@ -164,9 +227,49 @@ class TriadMatrixTestPlayer(Player):
         self._attr_volume_muted = muted
         self.update_state()
 
+    async def _media_for_backend(self, media: PlayerMedia) -> PlayerMedia:
+        """Convert queue media to one continuous flow stream for the hidden Sonos bus."""
+        if (
+            not media.source_id
+            or not media.queue_item_id
+            or media.media_type
+            in (
+                MediaType.RADIO,
+                MediaType.AUDIO_SOURCE,
+                MediaType.ANNOUNCEMENT,
+                MediaType.FLOW_STREAM,
+            )
+        ):
+            return media
+
+        # Resolve the URL against the logical Triad player, not the hidden Sonos
+        # Connect. Triad requires flow mode; resolving against Sonos would create
+        # a /single/ stream and make Sonos try to enqueue individual queue items.
+        flow_uri = await self.mass.streams.resolve_stream_url(
+            self.player_id,
+            media,
+        )
+
+        return PlayerMedia(
+            uri=flow_uri,
+            media_type=MediaType.FLOW_STREAM,
+            title=media.title,
+            artist=media.artist,
+            album=media.album,
+            image_url=media.image_url,
+            source_id=media.source_id,
+            queue_item_id=media.queue_item_id,
+            queue_session_id=media.queue_session_id,
+            custom_data={
+                **(media.custom_data or {}),
+                "triad_logical_player_id": self.player_id,
+            },
+        )
+
     async def play_media(self, media: PlayerMedia) -> None:
         """Start MA playback on an available source bus."""
         self._intentional_pause = False
+        backend_media = await self._media_for_backend(media)
         members = self._effective_members()
         bus, backend = await self._prov.claim_bus(
             self.player_id,
@@ -195,7 +298,7 @@ class TriadMatrixTestPlayer(Player):
             ):
                 await self.mass.players._handle_play_media(
                     backend.player_id,
-                    media,
+                    backend_media,
                 )
 
         except Exception:
@@ -223,18 +326,14 @@ class TriadMatrixTestPlayer(Player):
         self.update_state()
 
     async def play(self) -> None:
-        """Resume playback on the reserved Sonos backend."""
-        bus = self._get_owned_bus()
-        backend = self._prov.get_backend_player(bus)
-        assert backend is not None
+        """Resume the logical queue by rebuilding its flow stream at the saved position."""
+        self._get_owned_bus()
 
-        async with self.mass.players.get_player_lock(
-            backend.player_id,
-            PlayerLockPurpose.PLAYBACK,
-        ):
-            await self.mass.players._handle_cmd_play(
-                backend.player_id,
-            )
+        # Sonos deliberately implements pause of an MA stream as STOP. Therefore
+        # there is no backend transport to "unpause". Resume through the queue
+        # controller instead: it preserves queue.resume_pos, rotates/reloads the
+        # stream as needed, and eventually calls this player's play_media again.
+        await self.mass.player_queues.resume(self.player_id)
 
         self._intentional_pause = False
         self._attr_playback_state = PlaybackState.PLAYING
@@ -250,9 +349,12 @@ class TriadMatrixTestPlayer(Player):
             backend.player_id,
             PlayerLockPurpose.PLAYBACK,
         ):
-            await self.mass.players._handle_cmd_pause(
-                backend.player_id,
-            )
+            # Call the Sonos provider directly. MA's generic _handle_cmd_pause
+            # rejects the hidden Connect because its active "Music Assistant Queue"
+            # source advertises can_play_pause=False. Sonos itself deliberately
+            # handles an MA-queue pause by stopping its renderer, which is the
+            # transport behavior this logical Triad pause needs.
+            await backend.pause()
 
         self._intentional_pause = True
         self._attr_playback_state = PlaybackState.PAUSED

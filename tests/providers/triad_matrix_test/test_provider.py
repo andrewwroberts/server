@@ -8,9 +8,12 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from music_assistant_models.enums import PlaybackState
+from music_assistant_models.enums import MediaType, PlaybackState
+from music_assistant_models.player import PlayerMedia
 from music_assistant_models.errors import PlayerCommandFailed
 
+from music_assistant.controllers.player_queues.controller import PlayerQueuesController
+from music_assistant.controllers.players.controller import PlayerController
 from music_assistant.providers.triad_matrix_test.player import TriadMatrixTestPlayer
 from music_assistant.providers.triad_matrix_test.provider import (
     BUS_DEFINITIONS,
@@ -830,3 +833,349 @@ async def test_poll_preserves_paused_unrelated_media() -> None:
     )
 
     assert state == PlaybackState.PAUSED
+
+
+async def test_triad_pause_bypasses_generic_backend_source_guard() -> None:
+    """Pause must call the Sonos backend directly instead of MA's source guard."""
+    provider = _provider(
+        (
+            PlaybackState.PLAYING,
+            PlaybackState.IDLE,
+        )
+    )
+    player_id = next(iter(ROOMS))
+    bus = provider._buses[0]
+    bus.owner_id = player_id
+
+    backend = provider.mass.players.get_player(bus.backend_player_id)
+    assert backend is not None
+    backend.pause = AsyncMock()
+
+    generic_pause = AsyncMock(
+        side_effect=AssertionError("generic pause handler must not be called")
+    )
+    provider.mass.players._handle_cmd_pause = generic_pause
+    provider.mass.players.get_player_lock = MagicMock(
+        return_value=asyncio.Lock()
+    )
+
+    player = TriadMatrixTestPlayer.__new__(TriadMatrixTestPlayer)
+    player._provider = provider
+    player.mass = provider.mass
+    player._player_id = player_id
+    player._intentional_pause = False
+    player._attr_playback_state = PlaybackState.PLAYING
+    cast("Any", player).update_state = MagicMock()
+
+    await player.pause()
+
+    backend.pause.assert_awaited_once_with()
+    generic_pause.assert_not_awaited()
+    assert player._intentional_pause is True
+    assert player._attr_playback_state == PlaybackState.PAUSED
+
+
+async def test_poll_tracks_logical_queue_now_playing_metadata() -> None:
+    """Poll must follow the MA queue item rather than stale backend metadata."""
+    provider = _provider(
+        (
+            PlaybackState.PLAYING,
+            PlaybackState.IDLE,
+        )
+    )
+    player_id = next(iter(ROOMS))
+    room = ROOMS[player_id]
+    bus = provider._buses[0]
+    bus.owner_id = player_id
+
+    backend = provider.mass.players.get_player(bus.backend_player_id)
+    assert backend is not None
+    backend.state.elapsed_time = 999
+    backend.state.elapsed_time_last_updated = 999.0
+
+    current_item = SimpleNamespace(
+        queue_id=player_id,
+        queue_item_id="current-item",
+    )
+    current_media = SimpleNamespace(
+        source_id=player_id,
+        queue_item_id="current-item",
+        title="Current Track",
+        elapsed_time=None,
+        elapsed_time_last_updated=None,
+    )
+    queue = SimpleNamespace(
+        active=True,
+        ended=False,
+        current_item=current_item,
+        corrected_elapsed_time=42.5,
+        elapsed_time_last_updated=1234.0,
+    )
+    queue_data = SimpleNamespace(session_id="session-1")
+    media_from_item = AsyncMock(return_value=current_media)
+
+    provider.mass.player_queues = SimpleNamespace(
+        get=lambda queue_id: queue if queue_id == player_id else None,
+        queue_data_or_none=lambda queue_id: (
+            queue_data if queue_id == player_id else None
+        ),
+        flow_queue_exhausted=lambda queue_id, session_id: False,
+        player_media_from_queue_item=media_from_item,
+    )
+
+    provider.get_zone_state = AsyncMock(
+        return_value={
+            "entity_id": room["entity_id"],
+            "state": "on",
+            "attributes": {
+                "volume_level": 0.25,
+                "is_volume_muted": False,
+            },
+        }
+    )
+
+    player = TriadMatrixTestPlayer.__new__(TriadMatrixTestPlayer)
+    player._provider = provider
+    player.mass = provider.mass
+    player._player_id = player_id
+    player.zone_entity = str(room["entity_id"])
+    player._intentional_pause = False
+    player._attr_current_media = SimpleNamespace(
+        source_id=player_id,
+        queue_item_id="stale-item",
+        title="Stale Track",
+    )
+    player._attr_playback_state = PlaybackState.PLAYING
+    cast("Any", player).update_state = MagicMock()
+
+    await player.poll()
+
+    media_from_item.assert_awaited_once_with(current_item)
+    assert player._attr_current_media is current_media
+    assert player._attr_current_media.title == "Current Track"
+    assert player._attr_current_media.elapsed_time == 42
+    assert player._attr_current_media.elapsed_time_last_updated == 1234.0
+    assert player._attr_elapsed_time == 42.5
+    assert player._attr_elapsed_time_last_updated == 1234.0
+
+
+
+async def test_backend_queue_media_is_forced_to_triad_flow_stream() -> None:
+    """Queue tracks handed to hidden Sonos must use the logical Triad flow URL."""
+    player_id = next(iter(ROOMS))
+
+    resolve_stream_url = AsyncMock(
+        return_value=(
+            "http://mass.test/flow/session-1/"
+            f"{player_id}/item-1/{player_id}.flac"
+        )
+    )
+
+    player = TriadMatrixTestPlayer.__new__(TriadMatrixTestPlayer)
+    player.mass = SimpleNamespace(
+        streams=SimpleNamespace(
+            resolve_stream_url=resolve_stream_url,
+        )
+    )
+    player._player_id = player_id
+
+    original = PlayerMedia(
+        uri="spotify://track/example",
+        media_type=MediaType.TRACK,
+        title="Track One",
+        artist="Artist One",
+        album="Album One",
+        source_id=player_id,
+        queue_item_id="item-1",
+        queue_session_id="session-1",
+    )
+
+    backend_media = await player._media_for_backend(original)
+
+    resolve_stream_url.assert_awaited_once_with(player_id, original)
+    assert backend_media is not original
+    assert backend_media.media_type == MediaType.FLOW_STREAM
+    assert "/flow/" in backend_media.uri
+    assert "/single/" not in backend_media.uri
+    assert backend_media.source_id == player_id
+    assert backend_media.queue_item_id == "item-1"
+    assert backend_media.queue_session_id == "session-1"
+    assert backend_media.title == "Track One"
+    assert backend_media.artist == "Artist One"
+    assert backend_media.album == "Album One"
+    assert backend_media.custom_data == {
+        "triad_logical_player_id": player_id,
+    }
+
+
+
+async def test_triad_play_resumes_queue_instead_of_hidden_backend() -> None:
+    """A paused Triad session must rebuild its MA flow stream on resume."""
+    provider = _provider(
+        (
+            PlaybackState.IDLE,
+            PlaybackState.IDLE,
+        )
+    )
+    player_id = next(iter(ROOMS))
+    bus = provider._buses[0]
+    bus.owner_id = player_id
+
+    queue_resume = AsyncMock()
+    provider.mass.player_queues = SimpleNamespace(
+        resume=queue_resume,
+    )
+
+    generic_backend_play = AsyncMock()
+    provider.mass.players._handle_cmd_play = generic_backend_play
+
+    player = TriadMatrixTestPlayer.__new__(TriadMatrixTestPlayer)
+    player._provider = provider
+    player.mass = provider.mass
+    player._player_id = player_id
+    player._intentional_pause = True
+    player._attr_playback_state = PlaybackState.PAUSED
+    cast("Any", player).update_state = MagicMock()
+
+    await player.play()
+
+    queue_resume.assert_awaited_once_with(player_id)
+    generic_backend_play.assert_not_awaited()
+    assert player._intentional_pause is False
+    assert player._attr_playback_state == PlaybackState.PLAYING
+
+
+async def test_triad_pause_is_not_auto_stopped_by_queue_watchdog() -> None:
+    """A deliberately paused Triad queue must keep its reserved session alive."""
+    queue_id = next(iter(ROOMS))
+
+    queue = SimpleNamespace(
+        active=True,
+        state=PlaybackState.PLAYING,
+        corrected_elapsed_time=37.8,
+        resume_pos=0,
+    )
+    queue_data = SimpleNamespace(
+        queue=queue,
+        transitioning=False,
+    )
+
+    logical_player = SimpleNamespace(
+        state=SimpleNamespace(
+            playback_state=PlaybackState.PAUSED,
+        ),
+        auto_stop_paused_queue=False,
+        extra_data={},
+    )
+
+    handle_pause = AsyncMock()
+    create_task = MagicMock()
+
+    controller = PlayerQueuesController.__new__(PlayerQueuesController)
+    controller._queue_data = {
+        queue_id: queue_data,
+    }
+    controller.mass = SimpleNamespace(
+        cancel_timer=MagicMock(),
+        players=SimpleNamespace(
+            _handle_cmd_pause=handle_pause,
+            get_player=lambda player_id: (
+                logical_player if player_id == queue_id else None
+            ),
+        ),
+        create_task=create_task,
+    )
+    controller._check_player_permission = MagicMock()
+
+    await controller.pause(queue_id)
+
+    handle_pause.assert_awaited_once_with(queue_id)
+    assert queue.resume_pos == 37
+    create_task.assert_not_called()
+
+
+
+async def test_ad_hoc_leader_transfer_preserves_remaining_group_and_queue() -> None:
+    """Removing a playing leader must move its queue and preserve remaining rooms."""
+    leader_id = "triad_test_kitchen"
+    new_leader_id = "triad_test_breakfast_room"
+    remaining_id = "triad_test_dining_room"
+
+    leader = SimpleNamespace(
+        player_id=leader_id,
+        name="Kitchen",
+    )
+    active_queue = SimpleNamespace(
+        state=PlaybackState.PLAYING,
+    )
+
+    events: list[tuple[Any, ...]] = []
+
+    async def transfer_queue(
+        source_queue_id: str,
+        target_queue_id: str,
+        auto_play: bool | None = None,
+    ) -> None:
+        events.append(
+            ("transfer", source_queue_id, target_queue_id, auto_play)
+        )
+
+    async def set_members(
+        target_player: str,
+        player_ids_to_add: list[str] | None = None,
+        player_ids_to_remove: list[str] | None = None,
+    ) -> None:
+        events.append(
+            (
+                "group",
+                target_player,
+                tuple(player_ids_to_add or []),
+                tuple(player_ids_to_remove or []),
+            )
+        )
+
+    async def resume(queue_id: str) -> None:
+        events.append(("resume", queue_id))
+
+    controller = PlayerController.__new__(PlayerController)
+    controller.logger = MagicMock()
+    controller.mass = SimpleNamespace(
+        player_queues=SimpleNamespace(
+            transfer_queue=transfer_queue,
+            resume=resume,
+        )
+    )
+    controller.get_active_queue = MagicMock(return_value=active_queue)
+    controller._select_ad_hoc_leader = MagicMock(
+        return_value=new_leader_id
+    )
+    controller.cmd_set_members = set_members
+
+    await controller._transfer_ad_hoc_leadership(
+        leader,
+        [new_leader_id, remaining_id],
+    )
+
+    controller._select_ad_hoc_leader.assert_called_once_with(
+        leader,
+        [new_leader_id, remaining_id],
+    )
+
+    assert events == [
+        (
+            "transfer",
+            leader_id,
+            new_leader_id,
+            False,
+        ),
+        (
+            "group",
+            new_leader_id,
+            (remaining_id,),
+            (),
+        ),
+        (
+            "resume",
+            new_leader_id,
+        ),
+    ]

@@ -743,10 +743,13 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
             if player.state.playback_state == PlaybackState.PAUSED:
                 await self.stop(queue_id)
 
-        # we auto stop a player from paused when its paused for 30 seconds
+        # Most players are auto-stopped after a prolonged pause so stale
+        # transports do not linger. A provider may opt out when a paused logical
+        # session intentionally reserves resources that must survive the pause.
         if (
             queue_active
             and (queue_player := self.mass.players.get_player(queue_id))
+            and queue_player.auto_stop_paused_queue
             and not queue_player.extra_data.get(ATTR_ANNOUNCEMENT_IN_PROGRESS)
         ):
             self.mass.create_task(_watch_pause(queue_player))
