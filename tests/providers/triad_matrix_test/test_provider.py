@@ -963,6 +963,30 @@ async def test_poll_tracks_logical_queue_now_playing_metadata() -> None:
     assert player._attr_elapsed_time == 73.25
     assert player._attr_elapsed_time_last_updated == 888.0
 
+    # A newly started transport must reject an elapsed anchor that predates
+    # that transport. Otherwise corrected_elapsed_time extrapolates from the
+    # previous Sonos session and can jump many minutes or hours ahead.
+    player._transport_started_at = 1000.0
+    backend.state.elapsed_time = 9999.0
+    backend.state.elapsed_time_last_updated = 999.0
+
+    await player.poll()
+
+    assert player._attr_elapsed_time == 0.0
+    assert player._attr_elapsed_time_last_updated == 1000.0
+    assert player._transport_started_at == 1000.0
+
+    # Once Sonos publishes an anchor from the new transport session, adopt it
+    # normally and clear the startup guard.
+    backend.state.elapsed_time = 4.5
+    backend.state.elapsed_time_last_updated = 1001.0
+
+    await player.poll()
+
+    assert player._attr_elapsed_time == 4.5
+    assert player._attr_elapsed_time_last_updated == 1001.0
+    assert player._transport_started_at is None
+
 
 
 async def test_backend_queue_media_is_forced_to_triad_flow_stream() -> None:

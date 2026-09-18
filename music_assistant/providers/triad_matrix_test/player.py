@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from time import time
 from typing import TYPE_CHECKING, cast
 
 from music_assistant_models.enums import MediaType, PlaybackState, PlayerFeature
@@ -50,6 +51,11 @@ class TriadMatrixTestPlayer(Player):
         self._attr_volume_level = None
         self._attr_volume_muted = None
         self._intentional_pause = False
+        # Wall-clock time at which the current hidden-Sonos transport session
+        # was started. Sonos may briefly retain the previous session's elapsed
+        # anchor while the new stream is starting; never extrapolate from an
+        # anchor older than this session.
+        self._transport_started_at: float | None = None
 
     @property
     def requires_flow_mode(self) -> bool:
@@ -195,10 +201,35 @@ class TriadMatrixTestPlayer(Player):
             # Keep current_media metadata tied to the logical queue above, but always
             # publish the backend renderer's elapsed-time/timestamp pair as this
             # player's transport position.
-            self._attr_elapsed_time = backend.state.elapsed_time
-            self._attr_elapsed_time_last_updated = (
-                backend.state.elapsed_time_last_updated
+            backend_elapsed = backend.state.elapsed_time
+            backend_elapsed_updated = backend.state.elapsed_time_last_updated
+            transport_started_at = getattr(
+                self,
+                "_transport_started_at",
+                None,
             )
+
+            if (
+                transport_started_at is not None
+                and (
+                    backend_elapsed_updated is None
+                    or backend_elapsed_updated < transport_started_at
+                )
+            ):
+                # Sonos has entered PLAYING for the new stream but is still
+                # exposing the previous transport session's position timestamp.
+                # If we publish that stale anchor, corrected_elapsed_time adds
+                # all wall-clock time since the old session and the queue can
+                # jump minutes or hours ahead. The new flow stream starts at
+                # transport position zero; keep that fresh anchor until Sonos
+                # reports a timestamp belonging to this session.
+                self._attr_elapsed_time = 0.0
+                self._attr_elapsed_time_last_updated = transport_started_at
+            else:
+                self._attr_elapsed_time = backend_elapsed
+                self._attr_elapsed_time_last_updated = backend_elapsed_updated
+                if transport_started_at is not None:
+                    self._transport_started_at = None
 
         self.update_state()
 
@@ -293,6 +324,11 @@ class TriadMatrixTestPlayer(Player):
             for member in members:
                 await self._prov.route_zone_to_bus(member, bus)
                 routed.append(member)
+
+            # Mark the new transport before issuing play_media. Any Sonos
+            # elapsed-time timestamp older than this point belongs to the
+            # previous stream and must not be extrapolated as the new session.
+            self._transport_started_at = time()
 
             async with self.mass.players.get_player_lock(
                 backend.player_id,
