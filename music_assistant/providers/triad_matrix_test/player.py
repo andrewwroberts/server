@@ -140,7 +140,7 @@ class TriadMatrixTestPlayer(Player):
                             err,
                         )
 
-                queue_elapsed = getattr(queue, "corrected_elapsed_time", None)
+                queue_elapsed = getattr(queue, "elapsed_time", None)
                 if (
                     self._attr_current_media is not None
                     and self._attr_current_media.source_id == self.player_id
@@ -189,7 +189,7 @@ class TriadMatrixTestPlayer(Player):
             if queue_active and media_belongs_to_queue:
                 self._attr_elapsed_time = getattr(
                     queue,
-                    "corrected_elapsed_time",
+                    "elapsed_time",
                     None,
                 )
                 self._attr_elapsed_time_last_updated = getattr(
@@ -258,11 +258,16 @@ class TriadMatrixTestPlayer(Player):
             album=media.album,
             image_url=media.image_url,
             source_id=media.source_id,
-            queue_item_id=media.queue_item_id,
+            # Deliberately omit queue_item_id here. Sonos treats any media carrying
+            # both source_id and queue_item_id as a regular cloud-queue item before
+            # it considers FLOW_STREAM, which sends playback back through /single/
+            # and causes MA to attempt enqueue_next_media. The flow URL itself
+            # already contains the starting queue-item id.
             queue_session_id=media.queue_session_id,
             custom_data={
                 **(media.custom_data or {}),
                 "triad_logical_player_id": self.player_id,
+                "triad_start_queue_item_id": media.queue_item_id,
             },
         )
 

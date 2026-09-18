@@ -908,6 +908,7 @@ async def test_poll_tracks_logical_queue_now_playing_metadata() -> None:
         active=True,
         ended=False,
         current_item=current_item,
+        elapsed_time=40.0,
         corrected_elapsed_time=42.5,
         elapsed_time_last_updated=1234.0,
     )
@@ -953,9 +954,9 @@ async def test_poll_tracks_logical_queue_now_playing_metadata() -> None:
     media_from_item.assert_awaited_once_with(current_item)
     assert player._attr_current_media is current_media
     assert player._attr_current_media.title == "Current Track"
-    assert player._attr_current_media.elapsed_time == 42
+    assert player._attr_current_media.elapsed_time == 40
     assert player._attr_current_media.elapsed_time_last_updated == 1234.0
-    assert player._attr_elapsed_time == 42.5
+    assert player._attr_elapsed_time == 40.0
     assert player._attr_elapsed_time_last_updated == 1234.0
 
 
@@ -998,14 +999,24 @@ async def test_backend_queue_media_is_forced_to_triad_flow_stream() -> None:
     assert "/flow/" in backend_media.uri
     assert "/single/" not in backend_media.uri
     assert backend_media.source_id == player_id
-    assert backend_media.queue_item_id == "item-1"
+    # Critical Sonos transport requirement: if queue_item_id is present together
+    # with source_id, Sonos enters its cloud-queue path and resolves /single/.
+    assert backend_media.queue_item_id is None
     assert backend_media.queue_session_id == "session-1"
     assert backend_media.title == "Track One"
     assert backend_media.artist == "Artist One"
     assert backend_media.album == "Album One"
     assert backend_media.custom_data == {
         "triad_logical_player_id": player_id,
+        "triad_start_queue_item_id": "item-1",
     }
+
+    # This mirrors the Sonos play_media cloud-queue gate. A Triad flow handoff
+    # must never satisfy it.
+    assert not (
+        backend_media.source_id
+        and backend_media.queue_item_id
+    )
 
 
 
