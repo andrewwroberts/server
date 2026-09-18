@@ -186,22 +186,19 @@ class TriadMatrixTestPlayer(Player):
                 backend_playback_state = PlaybackState.PAUSED
 
             self._attr_playback_state = backend_playback_state
-            if queue_active and media_belongs_to_queue:
-                self._attr_elapsed_time = getattr(
-                    queue,
-                    "elapsed_time",
-                    None,
-                )
-                self._attr_elapsed_time_last_updated = getattr(
-                    queue,
-                    "elapsed_time_last_updated",
-                    None,
-                )
-            else:
-                self._attr_elapsed_time = backend.state.elapsed_time
-                self._attr_elapsed_time_last_updated = (
-                    backend.state.elapsed_time_last_updated
-                )
+            # The hidden Sonos renderer is the transport clock for the continuous
+            # flow stream. MA maps that stream-relative position through the flow
+            # stream log to derive the logical queue item's elapsed time. Feeding
+            # queue.elapsed_time back into the player here creates a circular clock
+            # and makes progress drift/jump.
+            #
+            # Keep current_media metadata tied to the logical queue above, but always
+            # publish the backend renderer's elapsed-time/timestamp pair as this
+            # player's transport position.
+            self._attr_elapsed_time = backend.state.elapsed_time
+            self._attr_elapsed_time_last_updated = (
+                backend.state.elapsed_time_last_updated
+            )
 
         self.update_state()
 

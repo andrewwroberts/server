@@ -890,8 +890,9 @@ async def test_poll_tracks_logical_queue_now_playing_metadata() -> None:
 
     backend = provider.mass.players.get_player(bus.backend_player_id)
     assert backend is not None
-    backend.state.elapsed_time = 999
-    backend.state.elapsed_time_last_updated = 999.0
+    # Backend transport position is the authoritative flow-stream clock.
+    backend.state.elapsed_time = 73.25
+    backend.state.elapsed_time_last_updated = 888.0
 
     current_item = SimpleNamespace(
         queue_id=player_id,
@@ -954,10 +955,13 @@ async def test_poll_tracks_logical_queue_now_playing_metadata() -> None:
     media_from_item.assert_awaited_once_with(current_item)
     assert player._attr_current_media is current_media
     assert player._attr_current_media.title == "Current Track"
+    # Current-media position is track-relative and comes from the logical queue.
     assert player._attr_current_media.elapsed_time == 40
     assert player._attr_current_media.elapsed_time_last_updated == 1234.0
-    assert player._attr_elapsed_time == 40.0
-    assert player._attr_elapsed_time_last_updated == 1234.0
+
+    # Player elapsed is flow-stream-relative and must come from the actual renderer.
+    assert player._attr_elapsed_time == 73.25
+    assert player._attr_elapsed_time_last_updated == 888.0
 
 
 
