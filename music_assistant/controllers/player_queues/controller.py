@@ -1157,10 +1157,26 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
         source_current_index = source_queue.current_index
         source_current_item = source_queue.current_item
 
-        # stop the source player synchronously to prevent the async stop from
-        # clear() racing with the target's sync group formation/protocol switching
+        # A queue transfer reuses the same QueueItem/StreamDetails objects on
+        # the target. Finish every source-side audio teardown before those
+        # objects can acquire target buffers; otherwise a delayed cleanup from
+        # the old queue can clear the new leader's freshly-created buffer.
         if source_queue.state != PlaybackState.IDLE:
-            await self.stop(source_queue_id)
+            source_session_id = self._queue_data[source_queue_id].session_id
+            self._check_player_permission(source_queue_id)
+            await self._handle_stop(
+                source_queue_id,
+                wait_for_audio_cleanup=True,
+            )
+            # A logically active queue should have a session, but if it does not,
+            # there was no session-scoped cleanup above. Clear any orphaned
+            # buffers synchronously before handing the items over.
+            if source_session_id is None:
+                await self._cleanup_queue_audio_data(source_queue_id)
+        else:
+            # Idle queues can still retain prepared buffers. A transfer must
+            # release them before the same items are attached to the target.
+            await self._cleanup_queue_audio_data(source_queue_id)
 
         target_queue.repeat_mode = source_queue.repeat_mode
         target_queue.shuffle_enabled = source_queue.shuffle_enabled
@@ -1191,7 +1207,13 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
         if source_current_item:
             target_queue.current_item = source_current_item
             target_queue.current_item.queue_id = target_queue_id
-        self._clear(source_queue_id, skip_stop=True)
+        # Source audio was synchronously released above. Do not schedule a
+        # second old-queue cleanup that could race with target playback.
+        self._clear(
+            source_queue_id,
+            skip_stop=True,
+            skip_audio_cleanup=True,
+        )
 
         await self.load(target_queue_id, source_items, keep_remaining=False, keep_played=False)
         for item in source_items:
@@ -1839,11 +1861,19 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
             raise InsufficientPermissions(msg)
 
     @handle_play_action
-    async def _handle_stop(self, queue_id: str) -> None:
+    async def _handle_stop(
+        self,
+        queue_id: str,
+        wait_for_audio_cleanup: bool = False,
+    ) -> None:
         """
         Handle stop without checking the caller's player permissions.
 
         :param queue_id: queue_id of the playerqueue to stop.
+        :param wait_for_audio_cleanup: Wait until this session's item buffers are
+            fully released before returning. Queue transfers require this because
+            they immediately reuse the same QueueItem/StreamDetails objects on a
+            different queue.
         """
         # cancel any pending play_index calls for this queue to prevent conflicts
         self.mass.cancel_timer(f"queue_play_index_{queue_id}")
@@ -1877,7 +1907,11 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
                 if queue_data.session_id == session_id:
                     queue_data.session_id = None
                 self.mass.streams.audio_processing.clear(queue_id, session_id)
-                self.mass.create_task(self._cleanup_queue_audio_data(queue_id, session_id))
+                cleanup = self._cleanup_queue_audio_data(queue_id, session_id)
+                if wait_for_audio_cleanup:
+                    await cleanup
+                else:
+                    self.mass.create_task(cleanup)
 
     @handle_play_action
     async def _handle_play(self, queue_id: str) -> None:
@@ -1904,7 +1938,12 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
         if (queue_data := self._queue_data.get(queue_id)) is not None:
             queue_data.transitioning = value
 
-    def _clear(self, queue_id: str, skip_stop: bool = False) -> None:
+    def _clear(
+        self,
+        queue_id: str,
+        skip_stop: bool = False,
+        skip_audio_cleanup: bool = False,
+    ) -> None:
         """Drop the queue's items and playback position, leaving user settings untouched."""
         queue = self._queue_data[queue_id].queue
         self.mass.streams.audio_processing.clear(queue_id)
@@ -1924,7 +1963,8 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
         queue.elapsed_time = 0
         queue.elapsed_time_last_updated = time.time()
         queue.index_in_buffer = None
-        self.mass.create_task(self._cleanup_queue_audio_data(queue_id))
+        if not skip_audio_cleanup:
+            self.mass.create_task(self._cleanup_queue_audio_data(queue_id))
         self.update_items(queue_id, [])
 
     def _reset_shuffle(self, queue_id: str) -> None:

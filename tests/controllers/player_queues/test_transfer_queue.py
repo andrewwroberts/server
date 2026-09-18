@@ -43,6 +43,9 @@ def _fake_controller(source_id: str, target_player: MagicMock) -> MagicMock:
     fake = MagicMock()
     fake.get = MagicMock(side_effect=lambda qid: source_queue if qid == source_id else target_queue)
     fake.stop = AsyncMock()
+    fake._handle_stop = AsyncMock()
+    fake._cleanup_queue_audio_data = AsyncMock()
+    fake._check_player_permission = MagicMock()
     fake.load = AsyncMock()
     fake.resume = AsyncMock()
     fake.clear = MagicMock()
@@ -174,6 +177,9 @@ def _shuffle_controller(
         ),
     }
     fake.stop = AsyncMock()
+    fake._handle_stop = AsyncMock()
+    fake._cleanup_queue_audio_data = AsyncMock()
+    fake._check_player_permission = MagicMock()
     fake.load = AsyncMock()
     fake.resume = AsyncMock()
     fake._clear = MagicMock()
@@ -196,6 +202,50 @@ def _shuffle_controller(
     fake.mass.players.get_player = MagicMock(return_value=target_player)
     fake.mass.streams.is_smart_fades_active = MagicMock(return_value=False)
     return fake
+
+
+async def test_transfer_queue_finishes_source_audio_cleanup_before_handover() -> None:
+    """
+    A playing source must finish its buffer teardown before target items are loaded.
+
+    The same QueueItem/StreamDetails objects move from source to target. A delayed
+    source cleanup could otherwise clear the target's newly-created resume buffer,
+    causing a timeout and an automatic skip to the next track.
+    """
+    fake = _shuffle_controller(source_shuffle_enabled=False)
+    source_queue = fake.get("src")
+    source_queue.state = PlaybackState.PAUSED
+    source_queue.resume_pos = 11
+
+    order: list[str] = []
+
+    async def _stop_source(*_args: object, **_kwargs: object) -> None:
+        order.append("stop-cleanup-finished")
+
+    async def _load_target(*_args: object, **_kwargs: object) -> None:
+        order.append("target-load")
+
+    fake._handle_stop.side_effect = _stop_source
+    fake.load.side_effect = _load_target
+
+    await PlayerQueuesController.transfer_queue(
+        cast("PlayerQueuesController", fake),
+        "src",
+        "tgt",
+        auto_play=False,
+    )
+
+    assert order == ["stop-cleanup-finished", "target-load"]
+    fake._check_player_permission.assert_called_once_with("src")
+    fake._handle_stop.assert_awaited_once_with(
+        "src",
+        wait_for_audio_cleanup=True,
+    )
+    fake._clear.assert_called_once_with(
+        "src",
+        skip_stop=True,
+        skip_audio_cleanup=True,
+    )
 
 
 async def test_transfer_queue_carries_the_album_credit_bookkeeping() -> None:
@@ -255,8 +305,14 @@ async def test_transfer_queue_carries_the_source_shuffle() -> None:
 async def test_transfer_queue_drops_dynamic_shuffle_from_source() -> None:
     """The shuffle imposed by a dynamic source follows it to the target queue."""
     fake = _shuffle_controller(source_shuffle_enabled=True, source_is_dynamic=True)
-    fake._clear.side_effect = lambda queue_id, skip_stop=False: PlayerQueuesController._clear(
-        cast("PlayerQueuesController", fake), queue_id, skip_stop
+    fake._clear.side_effect = (
+        lambda queue_id, skip_stop=False, skip_audio_cleanup=False:
+        PlayerQueuesController._clear(
+            cast("PlayerQueuesController", fake),
+            queue_id,
+            skip_stop,
+            skip_audio_cleanup,
+        )
     )
 
     await PlayerQueuesController.transfer_queue(

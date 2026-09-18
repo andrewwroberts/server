@@ -40,6 +40,7 @@ def _fake_controller() -> MagicMock:
         side_effect=lambda qid: d.queue if (d := fake._queue_data.get(qid)) else None
     )
     fake.mass.players._handle_cmd_stop = AsyncMock()
+    fake._cleanup_queue_audio_data = AsyncMock()
 
     def _close_coro(target: Any, **_kwargs: Any) -> None:
         # the cleanup is handed to create_task as a coroutine; nothing awaits it here
@@ -59,9 +60,17 @@ def _fake_controller() -> MagicMock:
     return fake
 
 
-async def _stop(fake: MagicMock) -> None:
+async def _stop(
+    fake: MagicMock,
+    *,
+    wait_for_audio_cleanup: bool = False,
+) -> None:
     """Run a stop against the fake controller."""
-    await PlayerQueuesController._handle_stop(cast("PlayerQueuesController", fake), "q")
+    await PlayerQueuesController._handle_stop(
+        cast("PlayerQueuesController", fake),
+        "q",
+        wait_for_audio_cleanup=wait_for_audio_cleanup,
+    )
 
 
 @pytest.mark.asyncio
@@ -75,6 +84,17 @@ async def test_stop_ends_the_session_and_clears_the_buffers() -> None:
     assert fake._queue_data["q"].session_id is None
     fake.mass.streams.audio_processing.clear.assert_called_once_with("q", "sess-1")
     fake._cleanup_queue_audio_data.assert_called_once_with("q", "sess-1")
+
+
+@pytest.mark.asyncio
+async def test_stop_can_wait_for_audio_cleanup_before_returning() -> None:
+    """Queue transfer can require stopped-session audio teardown to finish inline."""
+    fake = _fake_controller()
+
+    await _stop(fake, wait_for_audio_cleanup=True)
+
+    fake._cleanup_queue_audio_data.assert_awaited_once_with("q", "sess-1")
+    fake.mass.create_task.assert_not_called()
 
 
 @pytest.mark.asyncio
