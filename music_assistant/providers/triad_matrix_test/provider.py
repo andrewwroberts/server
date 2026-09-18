@@ -480,7 +480,7 @@ class TriadMatrixTestProvider(PlayerProvider):
         ]
 
         if not routed_players:
-            return True
+            return await self._prepare_backend_for_reclaim(bus, backend)
 
         non_idle_players = [
             player
@@ -594,7 +594,10 @@ class TriadMatrixTestProvider(PlayerProvider):
                     == bus.source_name
                 ]
 
-                if routed_players:
+                if (
+                    routed_players
+                    or backend.state.playback_state == PlaybackState.PAUSED
+                ):
                     if await self._reconcile_ownerless_idle_bus_locked(bus, states):
                         states = await self._get_zone_states(zone_entities)
                         if missing := set(zone_entities) - states.keys():
@@ -613,12 +616,12 @@ class TriadMatrixTestProvider(PlayerProvider):
                             == bus.source_name
                         ]
 
-                    if routed_players:
-                        busy.append(
-                            f"{bus.source_name} is already routed to "
-                            f"{', '.join(player.display_name for player in routed_players)}"
-                        )
-                        continue
+                if routed_players:
+                    busy.append(
+                        f"{bus.source_name} is already routed to "
+                        f"{', '.join(player.display_name for player in routed_players)}"
+                    )
+                    continue
 
                 if backend.state.playback_state != PlaybackState.IDLE:
                     busy.append(

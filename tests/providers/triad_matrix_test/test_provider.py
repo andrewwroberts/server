@@ -182,6 +182,50 @@ async def test_ownerless_idle_route_is_reclaimed_before_claim() -> None:
     turn_off.assert_awaited_once_with(stale)
 
 
+async def test_ownerless_paused_backend_without_routes_is_reclaimed_before_claim() -> None:
+    """An unrouted ownerless paused backend should be stopped and reused."""
+    provider = _provider(
+        (
+            PlaybackState.PAUSED,
+            PlaybackState.PLAYING,
+        )
+    )
+    new_owner_id = next(iter(ROOMS))
+
+    async def fake_prepare(bus: MatrixBus, backend: Any) -> bool:
+        backend.state.playback_state = PlaybackState.IDLE
+        return True
+
+    prepare = AsyncMock(side_effect=fake_prepare)
+    provider._prepare_backend_for_reclaim = prepare  # type: ignore[method-assign]
+
+    bus, _ = await provider.claim_bus(new_owner_id, [new_owner_id])
+
+    assert bus.source_name == "Connect 1"
+    assert bus.owner_id == new_owner_id
+    prepare.assert_awaited_once()
+
+
+async def test_ownerless_paused_backend_without_routes_stop_failure_refuses_claim() -> None:
+    """A failed stop of an unrouted paused backend must prevent its reuse."""
+    provider = _provider(
+        (
+            PlaybackState.PAUSED,
+            PlaybackState.PLAYING,
+        )
+    )
+    new_owner_id = next(iter(ROOMS))
+
+    prepare = AsyncMock(return_value=False)
+    provider._prepare_backend_for_reclaim = prepare  # type: ignore[method-assign]
+
+    with pytest.raises(PlayerCommandFailed, match="left untouched"):
+        await provider.claim_bus(new_owner_id, [new_owner_id])
+
+    prepare.assert_awaited_once()
+    assert all(bus.owner_id is None for bus in provider._buses)
+
+
 async def test_ownerless_paused_route_is_reclaimed_before_claim() -> None:
     """A stale ownerless route with a paused backend should be reclaimable."""
     provider = _provider(
