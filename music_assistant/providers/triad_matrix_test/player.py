@@ -51,11 +51,16 @@ class TriadMatrixTestPlayer(Player):
         self._attr_volume_level = None
         self._attr_volume_muted = None
         self._intentional_pause = False
-        # Wall-clock time at which the current hidden-Sonos transport session
-        # was started. Sonos may briefly retain the previous session's elapsed
-        # anchor while the new stream is starting; never extrapolate from an
-        # anchor older than this session.
+        # Timestamp immediately before the hidden Sonos transport is started.
+        # This is the stale-session cutoff: a renderer anchor older than this
+        # belongs to the previous stream and must never be reused.
         self._transport_started_at: float | None = None
+        # The logical transport clock begins only after the Sonos play command
+        # completes. Sonos can advance its renderer clock while the stream is
+        # still starting; that startup time must not appear as audible elapsed
+        # time on the logical Triad player.
+        self._transport_zero_at: float | None = None
+        self._transport_elapsed_offset: float | None = None
 
     @property
     def requires_flow_mode(self) -> bool:
@@ -208,28 +213,94 @@ class TriadMatrixTestPlayer(Player):
                 "_transport_started_at",
                 None,
             )
+            transport_zero_at = getattr(
+                self,
+                "_transport_zero_at",
+                None,
+            )
+            transport_elapsed_offset = getattr(
+                self,
+                "_transport_elapsed_offset",
+                None,
+            )
+            now = time()
 
-            if (
+            startup_anchor_pending = (
                 transport_started_at is not None
                 and (
-                    backend_elapsed_updated is None
+                    transport_zero_at is None
+                    or not isinstance(backend_elapsed, int | float)
+                    or not isinstance(backend_elapsed_updated, int | float)
                     or backend_elapsed_updated < transport_started_at
                 )
-            ):
-                # Sonos has entered PLAYING for the new stream but is still
-                # exposing the previous transport session's position timestamp.
-                # If we publish that stale anchor, corrected_elapsed_time adds
-                # all wall-clock time since the old session and the queue can
-                # jump minutes or hours ahead. The new flow stream starts at
-                # transport position zero; keep that fresh anchor until Sonos
-                # reports a timestamp belonging to this session.
+            )
+
+            if startup_anchor_pending:
+                # While the Sonos start call is still running, pin the logical
+                # clock at zero. Once that call completes, transport_zero_at is
+                # the earliest instant that should count as audible playback.
+                #
+                # This also preserves the stale-session guard: old Sonos elapsed
+                # anchors remain unusable until a timestamp from this transport
+                # arrives.
                 self._attr_elapsed_time = 0.0
-                self._attr_elapsed_time_last_updated = transport_started_at
+                self._attr_elapsed_time_last_updated = transport_zero_at or now
             else:
-                self._attr_elapsed_time = backend_elapsed
-                self._attr_elapsed_time_last_updated = backend_elapsed_updated
-                if transport_started_at is not None:
+                if (
+                    transport_started_at is not None
+                    and transport_zero_at is not None
+                    and isinstance(backend_elapsed, int | float)
+                    and isinstance(backend_elapsed_updated, int | float)
+                ):
+                    # Determine how much of the Sonos renderer clock accumulated
+                    # before the play command completed. Remove that startup lead
+                    # from this transport for its entire lifetime.
+                    backend_corrected_now = float(backend_elapsed)
+                    if backend_playback_state == PlaybackState.PLAYING:
+                        backend_corrected_now += max(
+                            0.0,
+                            now - float(backend_elapsed_updated),
+                        )
+
+                    logical_elapsed_now = max(
+                        0.0,
+                        now - transport_zero_at,
+                    )
+                    transport_elapsed_offset = max(
+                        0.0,
+                        backend_corrected_now - logical_elapsed_now,
+                    )
+                    self._transport_elapsed_offset = transport_elapsed_offset
                     self._transport_started_at = None
+                    self._transport_zero_at = None
+
+                if (
+                    transport_elapsed_offset
+                    and isinstance(backend_elapsed, int | float)
+                    and isinstance(backend_elapsed_updated, int | float)
+                ):
+                    # Re-anchor at the current instant after removing the startup
+                    # portion of the renderer clock. Keeping Sonos as the clock
+                    # source preserves natural flow-mode track transitions while
+                    # zero aligns with completed playback startup.
+                    backend_corrected_now = float(backend_elapsed)
+                    if backend_playback_state == PlaybackState.PLAYING:
+                        backend_corrected_now += max(
+                            0.0,
+                            now - float(backend_elapsed_updated),
+                        )
+
+                    self._attr_elapsed_time = max(
+                        0.0,
+                        backend_corrected_now - transport_elapsed_offset,
+                    )
+                    self._attr_elapsed_time_last_updated = now
+                else:
+                    self._attr_elapsed_time = backend_elapsed
+                    self._attr_elapsed_time_last_updated = backend_elapsed_updated
+                    if transport_started_at is not None:
+                        self._transport_started_at = None
+                        self._transport_zero_at = None
 
         self.update_state()
 
@@ -329,6 +400,8 @@ class TriadMatrixTestPlayer(Player):
             # elapsed-time timestamp older than this point belongs to the
             # previous stream and must not be extrapolated as the new session.
             self._transport_started_at = time()
+            self._transport_zero_at = None
+            self._transport_elapsed_offset = None
 
             async with self.mass.players.get_player_lock(
                 backend.player_id,
@@ -339,7 +412,13 @@ class TriadMatrixTestPlayer(Player):
                     backend_media,
                 )
 
+            # Do not count Sonos/flow startup latency as audible playback.
+            self._transport_zero_at = time()
+
         except Exception:
+            self._transport_started_at = None
+            self._transport_zero_at = None
+            self._transport_elapsed_offset = None
             cleanup_errors = await self._cleanup_session(bus, routed)
             if cleanup_errors:
                 self._prov.logger.error(
@@ -597,6 +676,9 @@ class TriadMatrixTestPlayer(Player):
         self._attr_active_source = None
         self._attr_elapsed_time = None
         self._attr_elapsed_time_last_updated = None
+        self._transport_started_at = None
+        self._transport_zero_at = None
+        self._transport_elapsed_offset = None
         self.update_state()
 
     @property
