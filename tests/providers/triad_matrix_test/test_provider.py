@@ -285,6 +285,46 @@ async def test_requested_room_with_ownerless_paused_route_can_be_reused() -> Non
     turn_off.assert_awaited_once_with(owner)
 
 
+async def test_requested_room_stale_route_on_other_bus_is_reclaimed_before_claim() -> None:
+    """A requested room must be detached from another stale bus before bus selection."""
+    provider = _provider()
+    owner_id = next(iter(ROOMS))
+
+    owner = _set_route(provider, owner_id, "Connect 2")
+    turn_off = _install_fake_turn_off(provider)
+
+    bus, _ = await provider.claim_bus(owner_id, [owner_id])
+
+    assert bus.source_name == "Connect 1"
+    assert bus.owner_id == owner_id
+    turn_off.assert_awaited_once_with(owner)
+
+
+async def test_requested_room_active_route_on_other_bus_refuses_claim() -> None:
+    """An active requested room on another bus must never be disconnected or stolen."""
+    provider = _provider(
+        (
+            PlaybackState.IDLE,
+            PlaybackState.PLAYING,
+        )
+    )
+    owner_id = next(iter(ROOMS))
+
+    _set_route(provider, owner_id, "Connect 2")
+    owner = provider.get_room_player(owner_id)
+    assert owner is not None
+    owner.state.playback_state = PlaybackState.PLAYING
+
+    turn_off = AsyncMock()
+    provider.turn_off_zone = turn_off  # type: ignore[method-assign]
+
+    with pytest.raises(PlayerCommandFailed, match="already routed to Connect 2"):
+        await provider.claim_bus(owner_id, [owner_id])
+
+    turn_off.assert_not_awaited()
+    assert all(bus.owner_id is None for bus in provider._buses)
+
+
 async def test_owned_idle_session_with_paused_backend_is_reclaimable() -> None:
     """An idle logical owner may release an ended paused backend."""
     provider = _provider(

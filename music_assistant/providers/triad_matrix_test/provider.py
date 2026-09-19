@@ -562,6 +562,66 @@ class TriadMatrixTestProvider(PlayerProvider):
                     "Home Assistant did not return every Triad room state; "
                     f"no source bus was claimed. Missing: {', '.join(sorted(missing))}."
                 )
+
+            # Before choosing a source bus, reconcile stale physical routes for
+            # every room that is about to join this new session. Otherwise an
+            # idle room left on Connect 2 can cause us to claim free Connect 1,
+            # only for route_zone_to_bus() to correctly refuse the cross-source
+            # reroute after the claim has already been made.
+            requested_players = []
+            for member_id in dict.fromkeys(member_ids):
+                member = self.get_room_player(member_id)
+                if member is None:
+                    raise PlayerCommandFailed(
+                        f"{member_id} is not a Triad room; no source bus was claimed."
+                    )
+                requested_players.append(member)
+
+            for member in requested_players:
+                source = (
+                    states.get(member.zone_entity, {}).get("attributes") or {}
+                ).get("source")
+                if source is None:
+                    continue
+
+                routed_bus = next(
+                    (
+                        candidate
+                        for candidate in self._buses
+                        if candidate.source_name == source
+                    ),
+                    None,
+                )
+                if routed_bus is None:
+                    raise PlayerCommandFailed(
+                        f"Refusing to reroute {member.display_name} from unexpected "
+                        f"source {source}; no source bus was claimed."
+                    )
+
+                if routed_bus.owner_id is not None:
+                    reclaimed = await self._reconcile_idle_bus_owner_locked(
+                        routed_bus.owner_id
+                    )
+                else:
+                    reclaimed = await self._reconcile_ownerless_idle_bus_locked(
+                        routed_bus,
+                        states,
+                    )
+
+                if not reclaimed:
+                    raise PlayerCommandFailed(
+                        f"{member.display_name} is already routed to {source}; "
+                        "no source bus was claimed and existing playback was left untouched."
+                    )
+
+                states = await self._get_zone_states(zone_entities)
+                if missing := set(zone_entities) - states.keys():
+                    raise PlayerCommandFailed(
+                        "Home Assistant did not return every Triad room state "
+                        "after requested-room reclamation; no source bus was claimed. "
+                        f"Missing: {', '.join(sorted(missing))}."
+                    )
+
             unavailable: list[str] = []
             busy: list[str] = []
 
