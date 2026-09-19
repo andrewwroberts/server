@@ -196,6 +196,9 @@ class TriadMatrixTestPlayer(Player):
             ):
                 backend_playback_state = PlaybackState.IDLE
 
+            if backend_playback_state == PlaybackState.PLAYING:
+                self._prov.mark_bus_playing(self.player_id)
+
             # The hidden Sonos renderer is the transport clock for the continuous
             # flow stream. A new Triad transport is not considered logically
             # PLAYING until that renderer has actually advanced. Sonos can report
@@ -410,8 +413,11 @@ class TriadMatrixTestPlayer(Player):
 
     async def play(self) -> None:
         """Resume the logical queue by rebuilding its flow stream at the saved position."""
-        self._get_owned_bus()
-
+        # A paused logical queue may no longer own its previous Connect: paused
+        # sessions are intentionally reclaimable when another play request needs
+        # capacity. Resume the MA queue first; play_media() will either reuse the
+        # existing reservation or claim an available bus for the fresh flow.
+        #
         # Sonos deliberately implements pause of an MA stream as STOP. Therefore
         # there is no backend transport to "unpause". Resume through the queue
         # controller instead: it preserves queue.resume_pos, rotates/reloads the

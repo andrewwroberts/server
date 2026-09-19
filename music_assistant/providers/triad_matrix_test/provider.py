@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
+from time import monotonic
 from typing import TYPE_CHECKING, Any, TypedDict
 
 from music_assistant_models.enums import PlaybackState, PlayerFeature
@@ -37,6 +38,7 @@ class MatrixBus:
 
     definition: BusDefinition
     owner_id: str | None = None
+    last_played_at: float = 0.0
 
     @property
     def source_name(self) -> str:
@@ -211,6 +213,28 @@ class TriadMatrixTestProvider(PlayerProvider):
             None,
         )
 
+    def mark_bus_playing(self, owner_id: str) -> None:
+        """Record real playback activity for LRU source-bus selection."""
+        bus = self.get_bus_for_owner(owner_id)
+        if bus is not None:
+            bus.last_played_at = monotonic()
+
+    def _bus_has_active_playback(self, bus: MatrixBus) -> bool:
+        """Return whether a bus is carrying a session that must not be stolen."""
+        if bus.owner_id is not None:
+            owner = self.get_room_player(bus.owner_id)
+            if (
+                owner is not None
+                and owner.state.playback_state == PlaybackState.PLAYING
+            ):
+                return True
+
+        backend = self.get_backend_player(bus, required=False)
+        return bool(
+            backend is not None
+            and backend.state.playback_state == PlaybackState.PLAYING
+        )
+
     def get_backend_player(
         self,
         bus: MatrixBus,
@@ -341,7 +365,7 @@ class TriadMatrixTestProvider(PlayerProvider):
         if owner is None or backend is None:
             return False
 
-        if owner.state.playback_state != PlaybackState.IDLE:
+        if owner.state.playback_state == PlaybackState.PLAYING:
             return False
 
         zone_entities = [player.zone_entity for player in self._players_by_id.values()]
@@ -381,19 +405,19 @@ class TriadMatrixTestProvider(PlayerProvider):
             )
             return False
 
-        non_idle_players = [
+        playing_players = [
             player
             for player in routed_players
-            if player.state.playback_state != PlaybackState.IDLE
+            if player.state.playback_state == PlaybackState.PLAYING
         ]
-        if non_idle_players:
+        if playing_players:
             self.logger.warning(
-                "TRIAD STALE BUS RECLAIM REFUSED: %s owner=%s has non-idle routed rooms=%s",
+                "TRIAD STALE BUS RECLAIM REFUSED: %s owner=%s has playing routed rooms=%s",
                 bus.source_name,
                 owner.display_name,
                 [
                     f"{player.display_name}={player.state.playback_state.value}"
-                    for player in non_idle_players
+                    for player in playing_players
                 ],
             )
             return False
@@ -482,18 +506,18 @@ class TriadMatrixTestProvider(PlayerProvider):
         if not routed_players:
             return await self._prepare_backend_for_reclaim(bus, backend)
 
-        non_idle_players = [
+        playing_players = [
             player
             for player in routed_players
-            if player.state.playback_state != PlaybackState.IDLE
+            if player.state.playback_state == PlaybackState.PLAYING
         ]
-        if non_idle_players:
+        if playing_players:
             self.logger.warning(
-                "TRIAD OWNERLESS BUS RECLAIM REFUSED: %s has non-idle routed rooms=%s",
+                "TRIAD OWNERLESS BUS RECLAIM REFUSED: %s has playing routed rooms=%s",
                 bus.source_name,
                 [
                     f"{player.display_name}={player.state.playback_state.value}"
-                    for player in non_idle_players
+                    for player in playing_players
                 ],
             )
             return False
@@ -625,7 +649,15 @@ class TriadMatrixTestProvider(PlayerProvider):
             unavailable: list[str] = []
             busy: list[str] = []
 
-            for bus in self._buses:
+            candidate_buses = sorted(
+                self._buses,
+                key=lambda candidate: (
+                    self._bus_has_active_playback(candidate),
+                    candidate.last_played_at,
+                ),
+            )
+
+            for bus in candidate_buses:
                 if bus.owner_id is not None:
                     stale_owner_id = bus.owner_id
                     if await self._reconcile_idle_bus_owner_locked(stale_owner_id):

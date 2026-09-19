@@ -356,8 +356,8 @@ async def test_owned_idle_session_with_paused_backend_is_reclaimable() -> None:
     turn_off.assert_awaited_once_with(owner)
 
 
-async def test_intentionally_paused_owned_session_is_not_reclaimed() -> None:
-    """A logical PAUSED session must remain reserved indefinitely."""
+async def test_intentionally_paused_owned_session_is_reclaimable() -> None:
+    """A logical PAUSED session may yield its Connect to a newer play request."""
     provider = _provider(
         (
             PlaybackState.PAUSED,
@@ -371,21 +371,25 @@ async def test_intentionally_paused_owned_session_is_not_reclaimed() -> None:
     bus = provider._buses[0]
     bus.owner_id = owner_id
 
-    provider._prepare_backend_for_reclaim = AsyncMock(  # type: ignore[method-assign]
-        return_value=True
-    )
-    provider.turn_off_zone = AsyncMock()  # type: ignore[method-assign]
+    turn_off = _install_fake_turn_off(provider)
+
+    async def fake_prepare(bus: MatrixBus, backend: Any) -> bool:
+        backend.state.playback_state = PlaybackState.IDLE
+        return True
+
+    prepare = AsyncMock(side_effect=fake_prepare)
+    provider._prepare_backend_for_reclaim = prepare  # type: ignore[method-assign]
 
     reclaimed = await provider.reconcile_idle_bus_owner(owner_id)
 
-    assert reclaimed is False
-    assert bus.owner_id == owner_id
-    provider._prepare_backend_for_reclaim.assert_not_awaited()
-    provider.turn_off_zone.assert_not_awaited()
+    assert reclaimed is True
+    assert bus.owner_id is None
+    prepare.assert_awaited_once()
+    turn_off.assert_awaited_once_with(owner)
 
 
-async def test_ownerless_logically_paused_room_is_not_reclaimed() -> None:
-    """A physically routed logical PAUSED room must block reclamation."""
+async def test_ownerless_logically_paused_room_is_reclaimable() -> None:
+    """A physically routed logical PAUSED room may be displaced on demand."""
     provider = _provider(
         (
             PlaybackState.PAUSED,
@@ -397,17 +401,110 @@ async def test_ownerless_logically_paused_room_is_not_reclaimed() -> None:
     player.state.playback_state = PlaybackState.PAUSED
 
     bus = provider._buses[0]
+    turn_off = _install_fake_turn_off(provider)
 
-    provider._prepare_backend_for_reclaim = AsyncMock(  # type: ignore[method-assign]
-        return_value=True
-    )
-    provider.turn_off_zone = AsyncMock()  # type: ignore[method-assign]
+    async def fake_prepare(bus: MatrixBus, backend: Any) -> bool:
+        backend.state.playback_state = PlaybackState.IDLE
+        return True
+
+    prepare = AsyncMock(side_effect=fake_prepare)
+    provider._prepare_backend_for_reclaim = prepare  # type: ignore[method-assign]
 
     reclaimed = await provider._reconcile_ownerless_idle_bus_locked(bus)
 
-    assert reclaimed is False
-    provider._prepare_backend_for_reclaim.assert_not_awaited()
-    provider.turn_off_zone.assert_not_awaited()
+    assert reclaimed is True
+    prepare.assert_awaited_once()
+    turn_off.assert_awaited_once_with(player)
+
+
+async def test_new_request_reclaims_paused_bus_not_playing_bus() -> None:
+    """One active stream is protected while the paused Connect is reused."""
+    provider = _provider(
+        (
+            PlaybackState.PLAYING,
+            PlaybackState.PAUSED,
+        )
+    )
+    playing_id, paused_id, new_id = list(ROOMS)[:3]
+
+    playing = _set_route(provider, playing_id, "Connect 1")
+    playing.state.playback_state = PlaybackState.PLAYING
+    provider._buses[0].owner_id = playing_id
+    provider._buses[0].last_played_at = 100.0
+
+    paused = _set_route(provider, paused_id, "Connect 2")
+    paused.state.playback_state = PlaybackState.PAUSED
+    provider._buses[1].owner_id = paused_id
+    provider._buses[1].last_played_at = 200.0
+
+    turn_off = _install_fake_turn_off(provider)
+
+    async def fake_prepare(bus: MatrixBus, backend: Any) -> bool:
+        backend.state.playback_state = PlaybackState.IDLE
+        return True
+
+    provider._prepare_backend_for_reclaim = AsyncMock(  # type: ignore[method-assign]
+        side_effect=fake_prepare
+    )
+
+    bus, _ = await provider.claim_bus(new_id, [new_id])
+
+    assert bus is provider._buses[1]
+    assert provider._buses[0].owner_id == playing_id
+    assert provider._buses[1].owner_id == new_id
+    turn_off.assert_awaited_once_with(paused)
+
+
+async def test_two_nonplaying_buses_reclaim_least_recently_playing() -> None:
+    """When neither stream is active, the least-recently-playing bus yields."""
+    provider = _provider(
+        (
+            PlaybackState.PAUSED,
+            PlaybackState.PAUSED,
+        )
+    )
+    newer_id, older_id, new_id = list(ROOMS)[:3]
+
+    newer = _set_route(provider, newer_id, "Connect 1")
+    newer.state.playback_state = PlaybackState.PAUSED
+    provider._buses[0].owner_id = newer_id
+    provider._buses[0].last_played_at = 200.0
+
+    older = _set_route(provider, older_id, "Connect 2")
+    older.state.playback_state = PlaybackState.PAUSED
+    provider._buses[1].owner_id = older_id
+    provider._buses[1].last_played_at = 100.0
+
+    turn_off = _install_fake_turn_off(provider)
+
+    async def fake_prepare(bus: MatrixBus, backend: Any) -> bool:
+        backend.state.playback_state = PlaybackState.IDLE
+        return True
+
+    provider._prepare_backend_for_reclaim = AsyncMock(  # type: ignore[method-assign]
+        side_effect=fake_prepare
+    )
+
+    bus, _ = await provider.claim_bus(new_id, [new_id])
+
+    assert bus is provider._buses[1]
+    assert provider._buses[0].owner_id == newer_id
+    assert provider._buses[1].owner_id == new_id
+    turn_off.assert_awaited_once_with(older)
+
+
+def test_mark_bus_playing_updates_lru_timestamp() -> None:
+    """Observed real playback updates the bus activity used for LRU selection."""
+    provider = _provider()
+    owner_id = next(iter(ROOMS))
+    bus = provider._buses[0]
+    bus.owner_id = owner_id
+
+    assert bus.last_played_at == 0.0
+
+    provider.mark_bus_playing(owner_id)
+
+    assert bus.last_played_at > 0.0
 
 
 async def test_ownerless_logically_playing_room_is_not_reclaimed() -> None:
@@ -1211,8 +1308,10 @@ async def test_triad_play_resumes_queue_instead_of_hidden_backend() -> None:
         )
     )
     player_id = next(iter(ROOMS))
-    bus = provider._buses[0]
-    bus.owner_id = player_id
+
+    # The paused queue may have yielded its old physical Connect. Resuming must
+    # still reach the queue controller so the rebuilt flow can claim a bus.
+    assert provider.get_bus_for_owner(player_id) is None
 
     queue_resume = AsyncMock()
     provider.mass.player_queues = SimpleNamespace(
