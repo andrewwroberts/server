@@ -2731,7 +2731,12 @@ class Player(ABC):
             new_media.elapsed_time_last_updated,
             prev_playing,
             new_playing,
-            force_adopt=mirrors_parent,
+            # A transition into PLAYING starts a new running clock even when
+            # the numeric media position itself has not changed. Preserve the
+            # freshly supplied timestamp instead of carrying forward the
+            # non-playing anchor, which would make elapsed time include pause
+            # or startup latency.
+            force_adopt=mirrors_parent or (not prev_playing and new_playing),
         )
         if not mirrors_parent:
             # steady playback resolves to the previous anchor, so nothing changed;

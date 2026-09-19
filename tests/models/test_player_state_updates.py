@@ -289,6 +289,43 @@ class TestNativeCurrentMediaPosition:
         assert published.elapsed_time == 5
         assert published.elapsed_time_last_updated == anchor
 
+    def test_transition_to_playing_adopts_fresh_media_anchor(
+        self, mock_mass: MagicMock
+    ) -> None:
+        """Starting playback must not extrapolate from the old non-playing timestamp."""
+        provider = MockProvider("test_provider", mass=mock_mass)
+        player = MockPlayer(provider, "player_1", "Player 1")
+
+        old_anchor = time.time() - 8
+        player._attr_playback_state = PlaybackState.PAUSED
+        player._attr_elapsed_time = 12.0
+        player._attr_elapsed_time_last_updated = old_anchor
+        player.set_current_media(uri="http://test/stream", title="Test")
+        assert player._attr_current_media is not None
+        player._attr_current_media.elapsed_time = 12
+        player._attr_current_media.elapsed_time_last_updated = old_anchor
+        player.update_state(signal_event=False)
+
+        assert player.state.current_media is not None
+        assert player.state.current_media.elapsed_time == 12
+        assert player.state.current_media.elapsed_time_last_updated == old_anchor
+
+        # Playback resumes at the same media position, but with a fresh anchor.
+        # Keeping old_anchor here would make the UI immediately count the whole
+        # startup/pause interval as elapsed playback.
+        fresh_anchor = time.time()
+        player._attr_playback_state = PlaybackState.PLAYING
+        player._attr_elapsed_time = 12.0
+        player._attr_elapsed_time_last_updated = fresh_anchor
+        assert player._attr_current_media is not None
+        player._attr_current_media.elapsed_time = 12
+        player._attr_current_media.elapsed_time_last_updated = fresh_anchor
+        player.update_state(signal_event=False)
+
+        assert player.state.current_media is not None
+        assert player.state.current_media.elapsed_time == 12
+        assert player.state.current_media.elapsed_time_last_updated == fresh_anchor
+
     def test_steady_playback_keeps_the_previous_anchor(self, mock_mass: MagicMock) -> None:
         """A regular playback tick keeps the anchor it already published."""
         anchor = time.time()
