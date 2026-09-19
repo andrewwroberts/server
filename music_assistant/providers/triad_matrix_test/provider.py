@@ -528,15 +528,52 @@ class TriadMatrixTestProvider(PlayerProvider):
             if player.state.synced_to
         ]
         if grouped_players:
-            self.logger.warning(
-                "TRIAD OWNERLESS BUS RECLAIM REFUSED: %s has grouped rooms=%s",
-                bus.source_name,
-                [
-                    f"{player.display_name}->{player.state.synced_to}"
-                    for player in grouped_players
-                ],
+            # MA represents a group with an unsynced leader and followers whose
+            # synced_to points at that leader. After a provider restart the
+            # in-memory bus owner can be gone while that logical grouping and
+            # physical matrix route remain. A wholly non-playing group is safe
+            # to reclaim only when the complete group topology is present on
+            # this one bus. Anything mixed or incomplete remains fail-closed.
+            group_leader_ids = {
+                player.state.synced_to
+                for player in grouped_players
+            }
+            routed_ids = {
+                player.player_id
+                for player in routed_players
+            }
+            group_leader_id = (
+                next(iter(group_leader_ids))
+                if len(group_leader_ids) == 1
+                else None
             )
-            return False
+            mixed_players = [
+                player
+                for player in routed_players
+                if (
+                    group_leader_id is not None
+                    and player.player_id != group_leader_id
+                    and player.state.synced_to != group_leader_id
+                )
+            ]
+
+            if (
+                group_leader_id is None
+                or group_leader_id not in routed_ids
+                or mixed_players
+            ):
+                self.logger.warning(
+                    "TRIAD OWNERLESS BUS RECLAIM REFUSED: %s has ambiguous grouped routes=%s",
+                    bus.source_name,
+                    [
+                        (
+                            f"{player.display_name}->"
+                            f"{player.state.synced_to or 'leader/ungrouped'}"
+                        )
+                        for player in routed_players
+                    ],
+                )
+                return False
 
         if not await self._prepare_backend_for_reclaim(bus, backend):
             return False

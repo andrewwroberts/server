@@ -627,7 +627,7 @@ async def test_ownerless_mixed_idle_and_playing_routes_refuses_without_cleanup()
 
 
 async def test_ownerless_grouped_route_refuses_without_cleanup() -> None:
-    """A grouped logical room must protect an ownerless physical route."""
+    """A grouped follower without its leader on the bus must block cleanup."""
     provider = _provider(
         (
             PlaybackState.IDLE,
@@ -638,6 +638,78 @@ async def test_ownerless_grouped_route_refuses_without_cleanup() -> None:
 
     stale = _set_route(provider, stale_id, "Connect 1")
     stale.state.synced_to = other_id
+
+    prepare = AsyncMock(return_value=True)
+    turn_off = AsyncMock()
+    provider._prepare_backend_for_reclaim = prepare  # type: ignore[method-assign]
+    provider.turn_off_zone = turn_off  # type: ignore[method-assign]
+
+    with pytest.raises(PlayerCommandFailed, match="left untouched"):
+        await provider.claim_bus(new_owner_id, [new_owner_id])
+
+    prepare.assert_not_awaited()
+    turn_off.assert_not_awaited()
+    assert all(bus.owner_id is None for bus in provider._buses)
+
+
+async def test_ownerless_paused_group_is_reclaimed_together() -> None:
+    """A complete non-playing logical group may yield its ownerless Connect."""
+    provider = _provider(
+        (
+            PlaybackState.PAUSED,
+            PlaybackState.PLAYING,
+        )
+    )
+    leader_id, follower_id, new_owner_id = list(ROOMS)[:3]
+
+    leader = _set_route(provider, leader_id, "Connect 1")
+    follower = _set_route(provider, follower_id, "Connect 1")
+    leader.state.playback_state = PlaybackState.PAUSED
+    follower.state.playback_state = PlaybackState.PAUSED
+    follower.state.synced_to = leader_id
+
+    turn_off = _install_fake_turn_off(provider)
+
+    async def fake_prepare(bus: MatrixBus, backend: Any) -> bool:
+        backend.state.playback_state = PlaybackState.IDLE
+        return True
+
+    prepare = AsyncMock(side_effect=fake_prepare)
+    provider._prepare_backend_for_reclaim = prepare  # type: ignore[method-assign]
+
+    bus, _ = await provider.claim_bus(new_owner_id, [new_owner_id])
+
+    assert bus is provider._buses[0]
+    assert bus.owner_id == new_owner_id
+    prepare.assert_awaited_once()
+    assert turn_off.await_count == 2
+    assert {
+        awaited.args[0].player_id
+        for awaited in turn_off.await_args_list
+    } == {
+        leader_id,
+        follower_id,
+    }
+
+
+async def test_ownerless_mixed_group_routes_refuse_without_cleanup() -> None:
+    """A grouped session sharing a bus with another route remains fail-closed."""
+    provider = _provider(
+        (
+            PlaybackState.IDLE,
+            PlaybackState.PLAYING,
+        )
+    )
+    leader_id, follower_id, unrelated_id, new_owner_id = list(ROOMS)[:4]
+
+    leader = _set_route(provider, leader_id, "Connect 1")
+    follower = _set_route(provider, follower_id, "Connect 1")
+    unrelated = _set_route(provider, unrelated_id, "Connect 1")
+
+    leader.state.playback_state = PlaybackState.PAUSED
+    follower.state.playback_state = PlaybackState.PAUSED
+    unrelated.state.playback_state = PlaybackState.IDLE
+    follower.state.synced_to = leader_id
 
     prepare = AsyncMock(return_value=True)
     turn_off = AsyncMock()
