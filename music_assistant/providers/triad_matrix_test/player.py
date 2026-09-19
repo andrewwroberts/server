@@ -176,6 +176,14 @@ class TriadMatrixTestPlayer(Player):
                     queue_data.session_id,
                 )
             )
+            queue_finished = bool(
+                queue is not None
+                and media_belongs_to_queue
+                and (
+                    queue.ended
+                    or flow_exhausted
+                )
+            )
 
             # An explicit Triad pause owns the logical transport state until a
             # new play_media() call clears _intentional_pause. Sonos implements
@@ -187,12 +195,7 @@ class TriadMatrixTestPlayer(Player):
                 backend_playback_state = PlaybackState.PAUSED
             elif (
                 backend_playback_state == PlaybackState.PAUSED
-                and queue is not None
-                and media_belongs_to_queue
-                and (
-                    queue.ended
-                    or flow_exhausted
-                )
+                and queue_finished
             ):
                 backend_playback_state = PlaybackState.IDLE
 
@@ -227,7 +230,35 @@ class TriadMatrixTestPlayer(Player):
                 and backend_elapsed_updated >= transport_started_at
             )
 
-            if transport_started_at is not None and not transport_confirmed:
+            finished_transport = (
+                queue_finished
+                and not self._intentional_pause
+                and backend_playback_state != PlaybackState.PLAYING
+            )
+
+            if finished_transport:
+                # The queue controller deliberately parks a naturally finished
+                # queue on its last item at 00:00. Sonos may retain a few seconds
+                # of flow-renderer position after playback has stopped. That
+                # renderer residue belongs to the expired transport and must not
+                # overwrite the logical ended-state clock.
+                finished_at = (
+                    getattr(queue, "elapsed_time_last_updated", None)
+                    if queue is not None
+                    else None
+                ) or time()
+
+                self._attr_playback_state = PlaybackState.IDLE
+                self._attr_elapsed_time = 0.0
+                self._attr_elapsed_time_last_updated = finished_at
+                self._transport_started_at = None
+                self._transport_elapsed_origin = None
+
+                if self._attr_current_media is not None and media_belongs_to_queue:
+                    self._attr_current_media.elapsed_time = 0
+                    self._attr_current_media.elapsed_time_last_updated = finished_at
+
+            elif transport_started_at is not None and not transport_confirmed:
                 # Keep the logical player non-running while the new Sonos
                 # transport has not advanced. This prevents corrected elapsed
                 # time and HA's media_position clock from running during startup.

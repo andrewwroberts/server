@@ -980,6 +980,96 @@ async def test_poll_treats_exhausted_flow_paused_backend_as_idle() -> None:
     assert state == PlaybackState.IDLE
 
 
+async def test_poll_clears_renderer_elapsed_residue_after_natural_end() -> None:
+    """A finished queue must not inherit Sonos' residual flow-stream position."""
+    provider = _provider(
+        (
+            PlaybackState.PAUSED,
+            PlaybackState.PLAYING,
+        )
+    )
+    player_id = next(iter(ROOMS))
+    room = ROOMS[player_id]
+
+    bus = provider._buses[0]
+    bus.owner_id = player_id
+
+    backend = provider.mass.players.get_player(bus.backend_player_id)
+    assert backend is not None
+
+    # Recreate the observed 00:03 residue: the expired flow renderer is at
+    # 8 seconds and this transport's renderer-space origin was 5 seconds.
+    backend.state.elapsed_time = 8.0
+    backend.state.elapsed_time_last_updated = 1234.0
+
+    current_item = SimpleNamespace(
+        queue_id=player_id,
+        queue_item_id="finished-item",
+    )
+    queue = SimpleNamespace(
+        active=True,
+        ended=True,
+        current_item=current_item,
+        elapsed_time=0.0,
+        elapsed_time_last_updated=1200.0,
+    )
+    queue_data = SimpleNamespace(
+        session_id="finished-session",
+    )
+
+    provider.mass.player_queues = SimpleNamespace(
+        get=lambda queue_id: queue if queue_id == player_id else None,
+        queue_data_or_none=lambda queue_id: (
+            queue_data if queue_id == player_id else None
+        ),
+        flow_queue_exhausted=lambda queue_id, session_id: (
+            queue_id == player_id
+            and session_id == "finished-session"
+        ),
+        player_media_from_queue_item=AsyncMock(),
+    )
+
+    provider.get_zone_state = AsyncMock(  # type: ignore[method-assign]
+        return_value={
+            "entity_id": room["entity_id"],
+            "state": "on",
+            "attributes": {},
+        }
+    )
+
+    current_media = SimpleNamespace(
+        source_id=player_id,
+        queue_item_id="finished-item",
+        elapsed_time=3,
+        elapsed_time_last_updated=1234.0,
+    )
+
+    player = TriadMatrixTestPlayer.__new__(TriadMatrixTestPlayer)
+    player._provider = provider
+    player.mass = provider.mass
+    player._player_id = player_id
+    player.zone_entity = str(room["entity_id"])
+    player._intentional_pause = False
+    player._attr_current_media = current_media
+    player._attr_playback_state = PlaybackState.PLAYING
+    player._attr_elapsed_time = 3.0
+    player._attr_elapsed_time_last_updated = 1234.0
+    player._transport_started_at = None
+    player._transport_elapsed_origin = 5.0
+    cast("Any", player).update_state = MagicMock()
+
+    await player.poll()
+
+    assert player._attr_playback_state == PlaybackState.IDLE
+    assert player._attr_elapsed_time == 0.0
+    assert player._attr_elapsed_time_last_updated == 1200.0
+    assert player._attr_current_media is current_media
+    assert player._attr_current_media.elapsed_time == 0
+    assert player._attr_current_media.elapsed_time_last_updated == 1200.0
+    assert player._transport_started_at is None
+    assert player._transport_elapsed_origin is None
+
+
 async def test_poll_preserves_pre_end_backend_pause() -> None:
     """A paused backend before flow exhaustion must not be guessed to have ended."""
     player_id = next(iter(ROOMS))
