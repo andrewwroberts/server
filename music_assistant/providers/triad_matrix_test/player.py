@@ -177,24 +177,24 @@ class TriadMatrixTestPlayer(Player):
                 )
             )
 
-            if backend_playback_state == PlaybackState.PLAYING:
-                self._intentional_pause = False
+            # An explicit Triad pause owns the logical transport state until a
+            # new play_media() call clears _intentional_pause. Sonos implements
+            # pause as STOP and can continue reporting PLAYING briefly while that
+            # stop is in flight. Treating that transient PLAYING report as a
+            # resume would re-enable flow reconciliation and allow the renderer
+            # clock to move the queue playhead backwards during the pause.
+            if self._intentional_pause:
+                backend_playback_state = PlaybackState.PAUSED
             elif (
                 backend_playback_state == PlaybackState.PAUSED
                 and queue is not None
                 and media_belongs_to_queue
                 and (
                     queue.ended
-                    or (flow_exhausted and not self._intentional_pause)
+                    or flow_exhausted
                 )
             ):
                 backend_playback_state = PlaybackState.IDLE
-            elif (
-                self._intentional_pause
-                and backend_playback_state
-                in (PlaybackState.IDLE, PlaybackState.PAUSED)
-            ):
-                backend_playback_state = PlaybackState.PAUSED
 
             # The hidden Sonos renderer is the transport clock for the continuous
             # flow stream. A new Triad transport is not considered logically

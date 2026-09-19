@@ -810,6 +810,19 @@ async def test_poll_preserves_intentional_pause_if_backend_reports_idle() -> Non
     assert state == PlaybackState.PAUSED
 
 
+async def test_poll_preserves_intentional_pause_while_backend_still_playing() -> None:
+    """A Sonos PLAYING report during STOP must not cancel an explicit pause."""
+    player_id = next(iter(ROOMS))
+
+    state = await _poll_playback_state(
+        PlaybackState.PLAYING,
+        intentional_pause=True,
+        media_source_id=player_id,
+    )
+
+    assert state == PlaybackState.PAUSED
+
+
 async def test_poll_preserves_playing_backend_for_exhausted_flow() -> None:
     """Flow exhaustion must not hide audio the backend still reports as playing."""
     player_id = next(iter(ROOMS))
