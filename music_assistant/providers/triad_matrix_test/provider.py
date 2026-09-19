@@ -768,6 +768,52 @@ class TriadMatrixTestProvider(PlayerProvider):
                 return bus, backend
 
             detail = "; ".join([*busy, *unavailable])
+
+            active_session_names: list[str] = []
+            for active_bus in self._buses:
+                if not self._bus_has_active_playback(active_bus):
+                    continue
+
+                if active_bus.owner_id is not None:
+                    active_owner = self.get_room_player(active_bus.owner_id)
+                    active_session_names.append(
+                        active_owner.display_name
+                        if active_owner is not None
+                        else active_bus.owner_id
+                    )
+                    continue
+
+                active_backend = self.get_backend_player(
+                    active_bus,
+                    required=False,
+                )
+                active_session_names.append(
+                    active_backend.display_name
+                    if active_backend is not None
+                    else active_bus.source_name
+                )
+
+            if len(active_session_names) == len(self._buses):
+                requested_player = self.get_room_player(owner_id)
+                requested_name = (
+                    requested_player.display_name
+                    if requested_player is not None
+                    else owner_id
+                )
+                active_sessions = ", ".join(active_session_names)
+
+                raise PlayerCommandFailed(
+                    f"Cannot start {requested_name}: both Triad music streams "
+                    f"are already playing ({active_sessions}). Pause or stop one "
+                    "and try again; existing playback and routes were left untouched.",
+                    translation_key="all_streams_busy",
+                    translation_owner="provider.triad_matrix_test",
+                    translation_args=[
+                        requested_name,
+                        active_sessions,
+                    ],
+                )
+
             raise PlayerCommandFailed(
                 "No free Triad music source is available; existing playback "
                 f"and routes were left untouched. {detail}"

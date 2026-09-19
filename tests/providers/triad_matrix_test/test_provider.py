@@ -162,8 +162,21 @@ async def test_two_active_claims_then_third_is_refused() -> None:
     assert first_bus.source_name == "Connect 1"
     assert second_bus.source_name == "Connect 2"
 
-    with pytest.raises(PlayerCommandFailed, match="left untouched"):
+    third = provider.get_room_player(third_id)
+    assert third is not None
+
+    with pytest.raises(
+        PlayerCommandFailed,
+        match="both Triad music streams are already playing",
+    ) as exc_info:
         await provider.claim_bus(third_id, [third_id])
+
+    assert exc_info.value.translation_key == "all_streams_busy"
+    assert exc_info.value.translation_owner == "provider.triad_matrix_test"
+    assert exc_info.value.translation_args == [
+        third.display_name,
+        f"{first.display_name}, {second.display_name}",
+    ]
 
     assert provider.get_bus_for_owner(first_id) is first_bus
     assert provider.get_bus_for_owner(second_id) is second_bus

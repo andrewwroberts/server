@@ -1,0 +1,8 @@
+{
+  "manifest": {
+    "description": "Experimental Music Assistant player provider for a Triad AMS matrix using two automatically allocated Sonos Connect transports."
+  },
+  "errors": {
+    "all_streams_busy": "Can't start {0}: both Triad music streams are already playing ({1}). Pause or stop one and try again."
+  }
+}
