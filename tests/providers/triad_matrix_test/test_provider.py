@@ -849,7 +849,6 @@ async def test_triad_pause_bypasses_generic_backend_source_guard() -> None:
 
     backend = provider.mass.players.get_player(bus.backend_player_id)
     assert backend is not None
-    backend.pause = AsyncMock()
 
     generic_pause = AsyncMock(
         side_effect=AssertionError("generic pause handler must not be called")
@@ -879,6 +878,19 @@ async def test_triad_pause_bypasses_generic_backend_source_guard() -> None:
     )
     provider.mass.cancel_task = MagicMock()
     provider.mass.cancel_timer = MagicMock()
+
+    async def assert_session_detached_before_backend_stop() -> None:
+        assert queue_data.session_id is None
+        close_superseded_item_streams.assert_called_once_with(
+            player_id,
+            None,
+        )
+        clear_processing.assert_not_called()
+        cleanup_audio.assert_not_awaited()
+
+    backend.pause = AsyncMock(
+        side_effect=assert_session_detached_before_backend_stop
+    )
 
     player._intentional_pause = False
     player._attr_playback_state = PlaybackState.PLAYING

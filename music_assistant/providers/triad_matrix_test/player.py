@@ -428,6 +428,13 @@ class TriadMatrixTestPlayer(Player):
         backend = self._prov.get_backend_player(bus)
         assert backend is not None
 
+        # Invalidate the old MA flow BEFORE telling Sonos to stop. Sonos can
+        # issue one final GET for the currently loaded flow URL while STOP is
+        # in progress. If that old session is still valid, the request can
+        # restart the flow from the URL's original queue item and move the
+        # logical queue playhead backwards at the exact moment pause is pressed.
+        session_id = self._detach_paused_audio_session()
+
         async with self.mass.players.get_player_lock(
             backend.player_id,
             PlayerLockPurpose.PLAYBACK,
@@ -439,11 +446,9 @@ class TriadMatrixTestPlayer(Player):
             # transport behavior this logical Triad pause needs.
             await backend.pause()
 
-        # The queue itself stays paused/resumable and keeps its Triad bus, but
-        # the source audio session must not stay alive. Otherwise its current
-        # and prepared buffers continue holding streaming-provider slots while
-        # the room may remain paused indefinitely.
-        await self._release_paused_audio_session()
+        # Now that the renderer is stopped, release the detached session's
+        # buffers/provider slots. The queue itself remains paused and resumable.
+        await self._cleanup_paused_audio_session(session_id)
 
         self._transport_started_at = None
         self._transport_elapsed_origin = None
@@ -451,37 +456,38 @@ class TriadMatrixTestPlayer(Player):
         self._attr_playback_state = PlaybackState.PAUSED
         self.update_state()
 
-    async def _release_paused_audio_session(self) -> None:
-        """Release source audio owned by the queue session being paused."""
+    def _detach_paused_audio_session(self) -> str | None:
+        """Invalidate the current flow session before stopping the Sonos renderer."""
         queue_data = self.mass.player_queues.queue_data_or_none(self.player_id)
         if queue_data is None or queue_data.session_id is None:
-            return
+            return None
 
         session_id = queue_data.session_id
 
         # Nothing should be allowed to create or attach another buffer for the
-        # old playback session while we tear it down.
+        # old playback session while pause tears it down.
         self.mass.cancel_task(f"preload_next_item_{self.player_id}")
         self.mass.cancel_timer(f"enqueue_next_item_{self.player_id}")
         self.mass.cancel_task(f"enqueue_next_item_{self.player_id}")
         self.mass.cancel_task(f"prepare_next_audio_buffer_{self.player_id}")
 
-        # Do not touch a replacement session if one somehow started while the
-        # backend pause was in flight.
         if queue_data.session_id != session_id:
-            return
+            return None
 
+        # This must happen before backend.pause(). A trailing Sonos GET using
+        # the old /flow/<session>/... URL will then fail the stream controller's
+        # session validation instead of restarting an earlier queue item.
         queue_data.session_id = None
-
-        # Sonos pause for an MA flow stream is implemented as STOP, but the old
-        # HTTP flow response can remain open after the renderer stops. Abort every
-        # response belonging to the now-ended queue session immediately so its
-        # flow generator, ffmpeg chain, prefetcher and provider source cannot
-        # linger into the next resume/start.
         self.mass.streams.close_superseded_item_streams(
             self.player_id,
             None,
         )
+        return session_id
+
+    async def _cleanup_paused_audio_session(self, session_id: str | None) -> None:
+        """Release buffers and provider source slots for a detached paused session."""
+        if session_id is None:
+            return
 
         self.mass.streams.audio_processing.clear(
             self.player_id,
