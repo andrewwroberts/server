@@ -472,6 +472,17 @@ class TriadMatrixTestPlayer(Player):
             return
 
         queue_data.session_id = None
+
+        # Sonos pause for an MA flow stream is implemented as STOP, but the old
+        # HTTP flow response can remain open after the renderer stops. Abort every
+        # response belonging to the now-ended queue session immediately so its
+        # flow generator, ffmpeg chain, prefetcher and provider source cannot
+        # linger into the next resume/start.
+        self.mass.streams.close_superseded_item_streams(
+            self.player_id,
+            None,
+        )
+
         self.mass.streams.audio_processing.clear(
             self.player_id,
             session_id,

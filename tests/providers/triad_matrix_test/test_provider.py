@@ -870,10 +870,12 @@ async def test_triad_pause_bypasses_generic_backend_source_guard() -> None:
         _cleanup_queue_audio_data=cleanup_audio,
     )
     clear_processing = MagicMock()
+    close_superseded_item_streams = MagicMock()
     provider.mass.streams = SimpleNamespace(
         audio_processing=SimpleNamespace(
             clear=clear_processing,
-        )
+        ),
+        close_superseded_item_streams=close_superseded_item_streams,
     )
     provider.mass.cancel_task = MagicMock()
     provider.mass.cancel_timer = MagicMock()
@@ -890,6 +892,10 @@ async def test_triad_pause_bypasses_generic_backend_source_guard() -> None:
     generic_pause.assert_not_awaited()
 
     assert queue_data.session_id is None
+    close_superseded_item_streams.assert_called_once_with(
+        player_id,
+        None,
+    )
     clear_processing.assert_called_once_with(
         player_id,
         "session-1",
