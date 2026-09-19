@@ -875,9 +875,7 @@ async def test_triad_pause_bypasses_generic_backend_source_guard() -> None:
     assert player._attr_playback_state == PlaybackState.PAUSED
 
 
-async def test_poll_tracks_logical_queue_now_playing_metadata(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_poll_tracks_logical_queue_now_playing_metadata() -> None:
     """Poll must follow the MA queue item rather than stale backend metadata."""
     provider = _provider(
         (
@@ -966,56 +964,28 @@ async def test_poll_tracks_logical_queue_now_playing_metadata(
     assert player._attr_elapsed_time_last_updated == 888.0
 
     # A newly started transport must reject an elapsed anchor that predates
-    # that transport. While the Sonos start call is still in progress, the
-    # logical clock stays pinned at zero rather than counting setup latency.
+    # that transport. Otherwise corrected_elapsed_time extrapolates from the
+    # previous Sonos session and can jump many minutes or hours ahead.
     player._transport_started_at = 1000.0
-    player._transport_zero_at = None
-    player._transport_elapsed_offset = None
     backend.state.elapsed_time = 9999.0
     backend.state.elapsed_time_last_updated = 999.0
-    monkeypatch.setattr(
-        "music_assistant.providers.triad_matrix_test.player.time",
-        lambda: 1004.0,
-    )
 
     await player.poll()
 
     assert player._attr_elapsed_time == 0.0
-    assert player._attr_elapsed_time_last_updated == 1004.0
+    assert player._attr_elapsed_time_last_updated == 1000.0
     assert player._transport_started_at == 1000.0
 
-    # The Sonos call completes eight seconds after dispatch. Its renderer clock
-    # has already accumulated those eight seconds, so the logical Triad clock
-    # must subtract them rather than exposing an eight-second lead.
-    player._transport_zero_at = 1008.0
-    backend.state.elapsed_time = 10.0
-    backend.state.elapsed_time_last_updated = 1010.0
-    monkeypatch.setattr(
-        "music_assistant.providers.triad_matrix_test.player.time",
-        lambda: 1010.0,
-    )
+    # Once Sonos publishes an anchor from the new transport session, adopt it
+    # normally and clear the startup guard.
+    backend.state.elapsed_time = 4.5
+    backend.state.elapsed_time_last_updated = 1001.0
 
     await player.poll()
 
-    assert player._transport_elapsed_offset == 8.0
-    assert player._attr_elapsed_time == 2.0
-    assert player._attr_elapsed_time_last_updated == 1010.0
+    assert player._attr_elapsed_time == 4.5
+    assert player._attr_elapsed_time_last_updated == 1001.0
     assert player._transport_started_at is None
-    assert player._transport_zero_at is None
-
-    # The correction is a fixed transport offset, not a hard-coded delay:
-    # later Sonos renderer positions continue advancing normally.
-    backend.state.elapsed_time = 12.0
-    backend.state.elapsed_time_last_updated = 1012.0
-    monkeypatch.setattr(
-        "music_assistant.providers.triad_matrix_test.player.time",
-        lambda: 1012.0,
-    )
-
-    await player.poll()
-
-    assert player._attr_elapsed_time == 4.0
-    assert player._attr_elapsed_time_last_updated == 1012.0
 
 
 
