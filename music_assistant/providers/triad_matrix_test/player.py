@@ -191,16 +191,12 @@ class TriadMatrixTestPlayer(Player):
             ):
                 backend_playback_state = PlaybackState.PAUSED
 
-            self._attr_playback_state = backend_playback_state
             # The hidden Sonos renderer is the transport clock for the continuous
-            # flow stream. MA maps that stream-relative position through the flow
-            # stream log to derive the logical queue item's elapsed time. Feeding
-            # queue.elapsed_time back into the player here creates a circular clock
-            # and makes progress drift/jump.
-            #
-            # Keep current_media metadata tied to the logical queue above, but always
-            # publish the backend renderer's elapsed-time/timestamp pair as this
-            # player's transport position.
+            # flow stream. A new Triad transport is not considered logically
+            # PLAYING until that renderer has actually advanced. Sonos can report
+            # PLAYING while it is still fetching/buffering the flow URL; publishing
+            # PLAYING at that point causes HA to extrapolate the elapsed timer
+            # before any audio has actually begun.
             backend_elapsed = backend.state.elapsed_time
             backend_elapsed_updated = backend.state.elapsed_time_last_updated
             transport_started_at = getattr(
@@ -209,26 +205,40 @@ class TriadMatrixTestPlayer(Player):
                 None,
             )
 
-            if (
-                transport_started_at is not None
-                and (
-                    backend_elapsed_updated is None
-                    or backend_elapsed_updated < transport_started_at
+            transport_confirmed = (
+                transport_started_at is None
+                or (
+                    backend_playback_state == PlaybackState.PLAYING
+                    and isinstance(backend_elapsed, int | float)
+                    and backend_elapsed > 0
+                    and isinstance(backend_elapsed_updated, int | float)
+                    and backend_elapsed_updated >= transport_started_at
                 )
-            ):
-                # Sonos has entered PLAYING for the new stream but is still
-                # exposing the previous transport session's position timestamp.
-                # If we publish that stale anchor, corrected_elapsed_time adds
-                # all wall-clock time since the old session and the queue can
-                # jump minutes or hours ahead. The new flow stream starts at
-                # transport position zero; keep that fresh anchor until Sonos
-                # reports a timestamp belonging to this session.
+            )
+
+            if transport_started_at is not None and not transport_confirmed:
+                # Keep the logical player non-running while the new Sonos
+                # transport has not advanced. This prevents corrected elapsed
+                # time and HA's media_position clock from running during startup.
+                self._attr_playback_state = (
+                    PlaybackState.PAUSED
+                    if self._attr_playback_state == PlaybackState.PAUSED
+                    else PlaybackState.IDLE
+                )
                 self._attr_elapsed_time = 0.0
-                self._attr_elapsed_time_last_updated = transport_started_at
+                self._attr_elapsed_time_last_updated = time()
             else:
+                self._attr_playback_state = backend_playback_state
                 self._attr_elapsed_time = backend_elapsed
                 self._attr_elapsed_time_last_updated = backend_elapsed_updated
+
                 if transport_started_at is not None:
+                    # The renderer has now genuinely advanced on this transport.
+                    # Re-anchor the logical queue at this instant so HA begins its
+                    # running timer from playback confirmation rather than from
+                    # the earlier buffer/load command.
+                    if queue is not None:
+                        queue.elapsed_time_last_updated = time()
                     self._transport_started_at = None
 
         self.update_state()
@@ -340,6 +350,7 @@ class TriadMatrixTestPlayer(Player):
                 )
 
         except Exception:
+            self._transport_started_at = None
             cleanup_errors = await self._cleanup_session(bus, routed)
             if cleanup_errors:
                 self._prov.logger.error(
@@ -360,7 +371,12 @@ class TriadMatrixTestPlayer(Player):
 
         self._attr_current_media = media
         self._attr_active_source = media.source_id or self.player_id
-        self._attr_playback_state = PlaybackState.PLAYING
+
+        # Loading the flow URL successfully is not the same thing as audible
+        # playback having started. Keep fresh starts idle, and resumes paused,
+        # until poll() sees the hidden Sonos renderer actually advance.
+        if self._attr_playback_state != PlaybackState.PAUSED:
+            self._attr_playback_state = PlaybackState.IDLE
         self.update_state()
 
     async def play(self) -> None:
@@ -374,8 +390,8 @@ class TriadMatrixTestPlayer(Player):
         await self.mass.player_queues.resume(self.player_id)
 
         self._intentional_pause = False
-        self._attr_playback_state = PlaybackState.PLAYING
-        self.update_state()
+        # play_media/poll owns the transition back to PLAYING. Do not start the
+        # logical elapsed clock before the hidden Sonos renderer has advanced.
 
     async def pause(self) -> None:
         """Pause playback without changing matrix routing."""
@@ -597,6 +613,7 @@ class TriadMatrixTestPlayer(Player):
         self._attr_active_source = None
         self._attr_elapsed_time = None
         self._attr_elapsed_time_last_updated = None
+        self._transport_started_at = None
         self.update_state()
 
     @property

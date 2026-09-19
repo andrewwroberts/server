@@ -964,28 +964,43 @@ async def test_poll_tracks_logical_queue_now_playing_metadata() -> None:
     assert player._attr_elapsed_time_last_updated == 888.0
 
     # A newly started transport must reject an elapsed anchor that predates
-    # that transport. Otherwise corrected_elapsed_time extrapolates from the
-    # previous Sonos session and can jump many minutes or hours ahead.
+    # that transport. It must also remain logically non-playing so neither MA
+    # nor HA can extrapolate an elapsed timer during renderer startup.
+    player._attr_playback_state = PlaybackState.IDLE
     player._transport_started_at = 1000.0
     backend.state.elapsed_time = 9999.0
     backend.state.elapsed_time_last_updated = 999.0
 
     await player.poll()
 
+    assert player._attr_playback_state == PlaybackState.IDLE
     assert player._attr_elapsed_time == 0.0
-    assert player._attr_elapsed_time_last_updated == 1000.0
     assert player._transport_started_at == 1000.0
 
-    # Once Sonos publishes an anchor from the new transport session, adopt it
-    # normally and clear the startup guard.
-    backend.state.elapsed_time = 4.5
+    # Even a fresh timestamp is not sufficient while the renderer position is
+    # still zero: Sonos can report PLAYING before audible playback begins.
+    backend.state.elapsed_time = 0.0
     backend.state.elapsed_time_last_updated = 1001.0
 
     await player.poll()
 
-    assert player._attr_elapsed_time == 4.5
-    assert player._attr_elapsed_time_last_updated == 1001.0
+    assert player._attr_playback_state == PlaybackState.IDLE
+    assert player._attr_elapsed_time == 0.0
+    assert player._transport_started_at == 1000.0
+
+    # Once the renderer genuinely advances on this transport, publish PLAYING,
+    # adopt the renderer clock and re-anchor the logical queue at confirmation.
+    old_queue_anchor = queue.elapsed_time_last_updated
+    backend.state.elapsed_time = 1.25
+    backend.state.elapsed_time_last_updated = 1002.0
+
+    await player.poll()
+
+    assert player._attr_playback_state == PlaybackState.PLAYING
+    assert player._attr_elapsed_time == 1.25
+    assert player._attr_elapsed_time_last_updated == 1002.0
     assert player._transport_started_at is None
+    assert queue.elapsed_time_last_updated > old_queue_anchor
 
 
 
@@ -1081,7 +1096,9 @@ async def test_triad_play_resumes_queue_instead_of_hidden_backend() -> None:
     queue_resume.assert_awaited_once_with(player_id)
     generic_backend_play.assert_not_awaited()
     assert player._intentional_pause is False
-    assert player._attr_playback_state == PlaybackState.PLAYING
+    # Resume rebuilds the flow transport, but the logical player must remain
+    # paused until the hidden Sonos renderer actually advances.
+    assert player._attr_playback_state == PlaybackState.PAUSED
 
 
 async def test_triad_pause_is_not_auto_stopped_by_queue_watchdog() -> None:
