@@ -1208,6 +1208,18 @@ class StreamsController(CoreController):
         queue_data = self.mass.player_queues.queue_data(queue_id)
         if queue_data.session_id is None or session_id != queue_data.session_id:
             raise web.HTTPNotFound(reason=f"Unknown (or invalid) session: {session_id}")
+        if (
+            request.method == "GET"
+            and self.mass.player_queues.flow_queue_exhausted(queue_id, session_id)
+        ):
+            self.logger.debug(
+                "Denying flow request for exhausted queue %s session %s",
+                queue.display_name,
+                session_id,
+            )
+            raise web.HTTPNotFound(
+                reason=f"Queue flow session already exhausted: {session_id}"
+            )
         if not (player := self.mass.players.get_player(player_id)):
             raise web.HTTPNotFound(reason=f"Unknown Player: {player_id}")
         start_queue_item_id = request.match_info["queue_item_id"]
