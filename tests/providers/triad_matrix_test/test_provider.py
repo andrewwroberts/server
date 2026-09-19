@@ -863,14 +863,57 @@ async def test_triad_pause_bypasses_generic_backend_source_guard() -> None:
     player._provider = provider
     player.mass = provider.mass
     player._player_id = player_id
+    cleanup_audio = AsyncMock()
+    queue_data = SimpleNamespace(session_id="session-1")
+    provider.mass.player_queues = SimpleNamespace(
+        queue_data_or_none=MagicMock(return_value=queue_data),
+        _cleanup_queue_audio_data=cleanup_audio,
+    )
+    clear_processing = MagicMock()
+    provider.mass.streams = SimpleNamespace(
+        audio_processing=SimpleNamespace(
+            clear=clear_processing,
+        )
+    )
+    provider.mass.cancel_task = MagicMock()
+    provider.mass.cancel_timer = MagicMock()
+
     player._intentional_pause = False
     player._attr_playback_state = PlaybackState.PLAYING
+    player._transport_started_at = 1000.0
+    player._transport_elapsed_origin = 8.0
     cast("Any", player).update_state = MagicMock()
 
     await player.pause()
 
     backend.pause.assert_awaited_once_with()
     generic_pause.assert_not_awaited()
+
+    assert queue_data.session_id is None
+    clear_processing.assert_called_once_with(
+        player_id,
+        "session-1",
+    )
+    cleanup_audio.assert_awaited_once_with(
+        player_id,
+        "session-1",
+    )
+
+    provider.mass.cancel_task.assert_any_call(
+        f"preload_next_item_{player_id}"
+    )
+    provider.mass.cancel_timer.assert_called_once_with(
+        f"enqueue_next_item_{player_id}"
+    )
+    provider.mass.cancel_task.assert_any_call(
+        f"enqueue_next_item_{player_id}"
+    )
+    provider.mass.cancel_task.assert_any_call(
+        f"prepare_next_audio_buffer_{player_id}"
+    )
+
+    assert player._transport_started_at is None
+    assert player._transport_elapsed_origin is None
     assert player._intentional_pause is True
     assert player._attr_playback_state == PlaybackState.PAUSED
 
@@ -968,6 +1011,7 @@ async def test_poll_tracks_logical_queue_now_playing_metadata() -> None:
     # nor HA can extrapolate an elapsed timer during renderer startup.
     player._attr_playback_state = PlaybackState.IDLE
     player._transport_started_at = 1000.0
+    player._transport_elapsed_origin = None
     backend.state.elapsed_time = 9999.0
     backend.state.elapsed_time_last_updated = 999.0
 
@@ -988,19 +1032,31 @@ async def test_poll_tracks_logical_queue_now_playing_metadata() -> None:
     assert player._attr_elapsed_time == 0.0
     assert player._transport_started_at == 1000.0
 
-    # Once the renderer genuinely advances on this transport, publish PLAYING,
-    # adopt the renderer clock and re-anchor the logical queue at confirmation.
+    # Sonos may already report several seconds of renderer time when audible
+    # playback finally starts. That first positive value becomes transport zero
+    # instead of being exposed as an immediate elapsed-time jump.
     old_queue_anchor = queue.elapsed_time_last_updated
-    backend.state.elapsed_time = 1.25
+    backend.state.elapsed_time = 8.25
     backend.state.elapsed_time_last_updated = 1002.0
 
     await player.poll()
 
     assert player._attr_playback_state == PlaybackState.PLAYING
-    assert player._attr_elapsed_time == 1.25
-    assert player._attr_elapsed_time_last_updated == 1002.0
+    assert player._attr_elapsed_time == 0.0
     assert player._transport_started_at is None
+    assert player._transport_elapsed_origin == 8.25
     assert queue.elapsed_time_last_updated > old_queue_anchor
+
+    # Subsequent renderer progress is measured relative to the fixed transport
+    # origin, so only genuinely post-start playback time is exposed.
+    backend.state.elapsed_time = 10.25
+    backend.state.elapsed_time_last_updated = 1004.0
+
+    await player.poll()
+
+    assert player._attr_playback_state == PlaybackState.PLAYING
+    assert player._attr_elapsed_time == 2.0
+    assert player._attr_elapsed_time_last_updated == 1004.0
 
 
 

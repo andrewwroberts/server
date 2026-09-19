@@ -56,6 +56,11 @@ class TriadMatrixTestPlayer(Player):
         # anchor while the new stream is starting; never extrapolate from an
         # anchor older than this session.
         self._transport_started_at: float | None = None
+        # Raw Sonos flow position observed when the current transport first
+        # genuinely began rendering. Sonos includes its startup/buffering time
+        # in that position, so logical Triad stream-time subtracts this fixed
+        # per-transport origin rather than exposing the startup lead.
+        self._transport_elapsed_origin: float | None = None
 
     @property
     def requires_flow_mode(self) -> bool:
@@ -204,16 +209,19 @@ class TriadMatrixTestPlayer(Player):
                 "_transport_started_at",
                 None,
             )
+            transport_elapsed_origin = getattr(
+                self,
+                "_transport_elapsed_origin",
+                None,
+            )
 
             transport_confirmed = (
-                transport_started_at is None
-                or (
-                    backend_playback_state == PlaybackState.PLAYING
-                    and isinstance(backend_elapsed, int | float)
-                    and backend_elapsed > 0
-                    and isinstance(backend_elapsed_updated, int | float)
-                    and backend_elapsed_updated >= transport_started_at
-                )
+                transport_started_at is not None
+                and backend_playback_state == PlaybackState.PLAYING
+                and isinstance(backend_elapsed, int | float)
+                and backend_elapsed > 0
+                and isinstance(backend_elapsed_updated, int | float)
+                and backend_elapsed_updated >= transport_started_at
             )
 
             if transport_started_at is not None and not transport_confirmed:
@@ -227,19 +235,38 @@ class TriadMatrixTestPlayer(Player):
                 )
                 self._attr_elapsed_time = 0.0
                 self._attr_elapsed_time_last_updated = time()
+
+            elif transport_confirmed:
+                # Sonos' first positive renderer position already contains the
+                # fetch/buffer startup interval. Treat that raw position as this
+                # transport's zero. From here onward we subtract only this fixed
+                # renderer-space origin; no wall-clock estimate is involved.
+                transport_elapsed_origin = float(backend_elapsed)
+                self._transport_elapsed_origin = transport_elapsed_origin
+                self._transport_started_at = None
+
+                self._attr_playback_state = backend_playback_state
+                self._attr_elapsed_time = 0.0
+                self._attr_elapsed_time_last_updated = time()
+
+                if queue is not None:
+                    queue.elapsed_time_last_updated = time()
+
             else:
                 self._attr_playback_state = backend_playback_state
-                self._attr_elapsed_time = backend_elapsed
-                self._attr_elapsed_time_last_updated = backend_elapsed_updated
 
-                if transport_started_at is not None:
-                    # The renderer has now genuinely advanced on this transport.
-                    # Re-anchor the logical queue at this instant so HA begins its
-                    # running timer from playback confirmation rather than from
-                    # the earlier buffer/load command.
-                    if queue is not None:
-                        queue.elapsed_time_last_updated = time()
-                    self._transport_started_at = None
+                if (
+                    transport_elapsed_origin is not None
+                    and isinstance(backend_elapsed, int | float)
+                ):
+                    self._attr_elapsed_time = max(
+                        0.0,
+                        float(backend_elapsed) - transport_elapsed_origin,
+                    )
+                else:
+                    self._attr_elapsed_time = backend_elapsed
+
+                self._attr_elapsed_time_last_updated = backend_elapsed_updated
 
         self.update_state()
 
@@ -339,6 +366,7 @@ class TriadMatrixTestPlayer(Player):
             # elapsed-time timestamp older than this point belongs to the
             # previous stream and must not be extrapolated as the new session.
             self._transport_started_at = time()
+            self._transport_elapsed_origin = None
 
             async with self.mass.players.get_player_lock(
                 backend.player_id,
@@ -351,6 +379,7 @@ class TriadMatrixTestPlayer(Player):
 
         except Exception:
             self._transport_started_at = None
+            self._transport_elapsed_origin = None
             cleanup_errors = await self._cleanup_session(bus, routed)
             if cleanup_errors:
                 self._prov.logger.error(
@@ -410,9 +439,47 @@ class TriadMatrixTestPlayer(Player):
             # transport behavior this logical Triad pause needs.
             await backend.pause()
 
+        # The queue itself stays paused/resumable and keeps its Triad bus, but
+        # the source audio session must not stay alive. Otherwise its current
+        # and prepared buffers continue holding streaming-provider slots while
+        # the room may remain paused indefinitely.
+        await self._release_paused_audio_session()
+
+        self._transport_started_at = None
+        self._transport_elapsed_origin = None
         self._intentional_pause = True
         self._attr_playback_state = PlaybackState.PAUSED
         self.update_state()
+
+    async def _release_paused_audio_session(self) -> None:
+        """Release source audio owned by the queue session being paused."""
+        queue_data = self.mass.player_queues.queue_data_or_none(self.player_id)
+        if queue_data is None or queue_data.session_id is None:
+            return
+
+        session_id = queue_data.session_id
+
+        # Nothing should be allowed to create or attach another buffer for the
+        # old playback session while we tear it down.
+        self.mass.cancel_task(f"preload_next_item_{self.player_id}")
+        self.mass.cancel_timer(f"enqueue_next_item_{self.player_id}")
+        self.mass.cancel_task(f"enqueue_next_item_{self.player_id}")
+        self.mass.cancel_task(f"prepare_next_audio_buffer_{self.player_id}")
+
+        # Do not touch a replacement session if one somehow started while the
+        # backend pause was in flight.
+        if queue_data.session_id != session_id:
+            return
+
+        queue_data.session_id = None
+        self.mass.streams.audio_processing.clear(
+            self.player_id,
+            session_id,
+        )
+        await self.mass.player_queues._cleanup_queue_audio_data(
+            self.player_id,
+            session_id,
+        )
 
     async def stop(self) -> None:
         """Stop and release this logical room group's source bus."""
@@ -614,6 +681,7 @@ class TriadMatrixTestPlayer(Player):
         self._attr_elapsed_time = None
         self._attr_elapsed_time_last_updated = None
         self._transport_started_at = None
+        self._transport_elapsed_origin = None
         self.update_state()
 
     @property
