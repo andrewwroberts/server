@@ -880,11 +880,23 @@ async def test_triad_pause_bypasses_generic_backend_source_guard() -> None:
     provider.mass.cancel_timer = MagicMock()
 
     async def assert_session_detached_before_backend_stop() -> None:
+        # The logical transport must already be frozen before Sonos STOP can
+        # reset its renderer clock. Otherwise flow reconciliation can rewind
+        # the queue to the first item during the pause transition.
+        assert player._intentional_pause is True
+        assert player._attr_playback_state == PlaybackState.PAUSED
+        assert player._transport_started_at is None
+        assert player._transport_elapsed_origin is None
+
+        # The old flow session must also already be invalid so a trailing Sonos
+        # GET cannot restart the flow at its original start item.
         assert queue_data.session_id is None
         close_superseded_item_streams.assert_called_once_with(
             player_id,
             None,
         )
+
+        # Buffer/provider cleanup deliberately follows the physical stop.
         clear_processing.assert_not_called()
         cleanup_audio.assert_not_awaited()
 

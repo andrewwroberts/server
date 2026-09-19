@@ -428,11 +428,28 @@ class TriadMatrixTestPlayer(Player):
         backend = self._prov.get_backend_player(bus)
         assert backend is not None
 
-        # Invalidate the old MA flow BEFORE telling Sonos to stop. Sonos can
-        # issue one final GET for the currently loaded flow URL while STOP is
-        # in progress. If that old session is still valid, the request can
-        # restart the flow from the URL's original queue item and move the
-        # logical queue playhead backwards at the exact moment pause is pressed.
+        # Freeze the logical player BEFORE touching the Sonos renderer.
+        #
+        # Sonos implements pause of an MA flow stream as STOP. During that STOP
+        # its renderer clock can reset toward zero before the backend state
+        # update reaches us. If the logical Triad player is still PLAYING in
+        # that window, flow-mode reconciliation interprets the reset cumulative
+        # clock as the beginning of the flow and rewinds queue.current_item to
+        # the first track. player_queues.pause() has already captured the real
+        # resume_pos, so that leaves the queue with a first-track current item
+        # and a second-track resume position.
+        #
+        # Publishing PAUSED first freezes flow-mode reconciliation on the
+        # already-correct queue item and elapsed position while Sonos stops.
+        self._intentional_pause = True
+        self._transport_started_at = None
+        self._transport_elapsed_origin = None
+        self._attr_playback_state = PlaybackState.PAUSED
+        self.update_state()
+
+        # Invalidate the old MA flow before telling Sonos to stop. Any trailing
+        # GET for the old flow URL is then rejected instead of restarting from
+        # that URL's original queue item.
         session_id = self._detach_paused_audio_session()
 
         async with self.mass.players.get_player_lock(
@@ -450,10 +467,9 @@ class TriadMatrixTestPlayer(Player):
         # buffers/provider slots. The queue itself remains paused and resumable.
         await self._cleanup_paused_audio_session(session_id)
 
-        self._transport_started_at = None
-        self._transport_elapsed_origin = None
-        self._intentional_pause = True
-        self._attr_playback_state = PlaybackState.PAUSED
+        # The logical state was frozen before backend.pause(); do not publish
+        # another transport transition here. The queue remains paused/resumable
+        # on the exact item and position captured by PlayerQueuesController.
         self.update_state()
 
     def _detach_paused_audio_session(self) -> str | None:
