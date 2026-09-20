@@ -1588,9 +1588,17 @@ class MusicProvider(Provider):
                     self.logger.warning(
                         "SPOTIFY_PLAYLIST_DIAG "
                         "target_existing_lookup "
-                        "existing=%s db_id=%s mappings=%r",
+                        "existing=%s db_id=%s library_name=%r "
+                        "library_owner=%r favorite=%r mappings=%r",
                         library_item is not None,
                         db_id,
+                        library_item.name if library_item else None,
+                        getattr(library_item, "owner", None)
+                        if library_item
+                        else None,
+                        library_item.favorite
+                        if library_item
+                        else None,
                         (
                             [
                                 (
