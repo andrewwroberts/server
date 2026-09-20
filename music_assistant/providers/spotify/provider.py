@@ -391,67 +391,10 @@ class SpotifyProvider(MusicProvider):
         Note: We use the global session here because playlists like "Daily Mix"
         are only returned when using the non-dev (global) token.
         """
-        diag_target_id = "3P0Cuu6Dcnwk2rJpYM5C2S"
-        diag_target_seen = False
-
-        self.logger.warning(
-            "SPOTIFY_PLAYLIST_DIAG scan_start target_id=%s",
-            diag_target_id,
-        )
-
         yield await self._get_liked_songs_playlist()
-
-        async for item in self._get_all_items(
-            "me/playlists",
-            use_global_session=True,
-        ):
-            if not (item and item.get("id")):
-                continue
-
-            if item["id"] == diag_target_id:
-                diag_target_seen = True
-                owner = item.get("owner") or {}
-                owner_name = (
-                    owner.get("display_name")
-                    if isinstance(owner, dict)
-                    else None
-                )
-
-                self.logger.warning(
-                    "SPOTIFY_PLAYLIST_DIAG "
-                    "target_returned_by_me_playlists "
-                    "id=%s name=%r owner=%r snapshot_id=%r",
-                    item["id"],
-                    item.get("name"),
-                    owner_name,
-                    item.get("snapshot_id"),
-                )
-
-            playlist = parse_playlist(item, self)
-
-            if item["id"] == diag_target_id:
-                self.logger.warning(
-                    "SPOTIFY_PLAYLIST_DIAG target_parsed "
-                    "id=%s parsed_name=%r provider=%s mappings=%r",
-                    playlist.item_id,
-                    playlist.name,
-                    playlist.provider,
-                    [
-                        (
-                            mapping.provider_instance,
-                            mapping.item_id,
-                            mapping.in_library,
-                        )
-                        for mapping in playlist.provider_mappings
-                    ],
-                )
-
-            yield playlist
-
-        self.logger.warning(
-            "SPOTIFY_PLAYLIST_DIAG scan_end target_seen=%s",
-            diag_target_seen,
-        )
+        async for item in self._get_all_items("me/playlists", use_global_session=True):
+            if item and item["id"]:
+                yield parse_playlist(item, self)
 
     async def browse(self, path: str) -> Sequence[MediaItemType | ItemMapping | BrowseFolder]:
         """
@@ -1583,86 +1526,27 @@ class SpotifyProvider(MusicProvider):
     ) -> AsyncGenerator[dict[str, Any]]:
         """Get all items from a paged list."""
         offset = 0
-
-        meta = await self._get_cached_paginated_meta(
-            endpoint,
-            limit=1,
-            offset=0,
-            **kwargs,
-        )
-
+        # single request to fetch the etag (used as cache checksum) and total
+        meta = await self._get_cached_paginated_meta(endpoint, limit=1, offset=0, **kwargs)
         cache_checksum = meta["etag"]
         total = meta["total"]
-
-        if endpoint == "me/playlists":
-            self.logger.warning(
-                "SPOTIFY_PLAYLIST_DIAG pagination_meta "
-                "total=%s etag=%r page_limit=%s",
-                total,
-                cache_checksum,
-                limit,
-            )
-
         while True:
+            # Avoid requesting beyond the known end. Spotify can return 5xx
+            # for offset >= total on some endpoints (e.g. algorithmic playlists).
             if total and offset >= total:
-                if endpoint == "me/playlists":
-                    self.logger.warning(
-                        "SPOTIFY_PLAYLIST_DIAG pagination_stop "
-                        "reason=known_total offset=%s total=%s",
-                        offset,
-                        total,
-                    )
                 break
-
-            request_offset = offset
-
             result = await self._get_data_with_caching(
-                endpoint,
-                cache_checksum=cache_checksum,
-                limit=limit,
-                offset=offset,
-                **kwargs,
+                endpoint, cache_checksum=cache_checksum, limit=limit, offset=offset, **kwargs
             )
-
             offset += limit
-
             if not result or key not in result or not result[key]:
-                if endpoint == "me/playlists":
-                    self.logger.warning(
-                        "SPOTIFY_PLAYLIST_DIAG pagination_stop "
-                        "reason=empty_page offset=%s",
-                        request_offset,
-                    )
                 break
-
-            items = result[key]
-
-            if endpoint == "me/playlists":
-                self.logger.warning(
-                    "SPOTIFY_PLAYLIST_DIAG page_processed "
-                    "offset=%s count=%s target_present=%s",
-                    request_offset,
-                    len(items),
-                    any(
-                        item
-                        and item.get("id") == "3P0Cuu6Dcnwk2rJpYM5C2S"
-                        for item in items
-                    ),
-                )
-
-            for item in items:
+            for item in result[key]:
+                # Spotify returns a null entry for items the account can no longer resolve
                 if item is None:
                     continue
                 yield item
-
-            if len(items) < limit:
-                if endpoint == "me/playlists":
-                    self.logger.warning(
-                        "SPOTIFY_PLAYLIST_DIAG pagination_stop "
-                        "reason=short_page offset=%s count=%s",
-                        request_offset,
-                        len(items),
-                    )
+            if len(result[key]) < limit:
                 break
 
     async def _get_data_with_caching(
@@ -1670,70 +1554,17 @@ class SpotifyProvider(MusicProvider):
     ) -> dict[str, Any]:
         """Get data from api with caching."""
         cache_key_parts = [endpoint]
-
         for key in sorted(kwargs.keys()):
             cache_key_parts.append(f"{key}{kwargs[key]}")
-
         cache_key = ".".join(map(str, cache_key_parts))
-
-        cached = await self.mass.cache.get(
-            cache_key,
-            provider=self.instance_id,
-            checksum=cache_checksum,
-            allow_bypass=False,
-        )
-
-        if cached:
-            if endpoint == "me/playlists":
-                cached_items = cached.get("items") or []
-
-                self.logger.warning(
-                    "SPOTIFY_PLAYLIST_DIAG page "
-                    "source=cache offset=%s count=%s total=%s "
-                    "target_present=%s checksum=%r",
-                    kwargs.get("offset"),
-                    len(cached_items),
-                    cached.get("total"),
-                    any(
-                        item
-                        and item.get("id") == "3P0Cuu6Dcnwk2rJpYM5C2S"
-                        for item in cached_items
-                    ),
-                    cache_checksum,
-                )
-
+        if cached := await self.mass.cache.get(
+            cache_key, provider=self.instance_id, checksum=cache_checksum, allow_bypass=False
+        ):
             return cast("dict[str, Any]", cached)
-
-        result = await self._get_data(
-            endpoint,
-            **kwargs,
-        )
-
-        if endpoint == "me/playlists":
-            result_items = result.get("items") or []
-
-            self.logger.warning(
-                "SPOTIFY_PLAYLIST_DIAG page "
-                "source=live offset=%s count=%s total=%s "
-                "target_present=%s checksum=%r",
-                kwargs.get("offset"),
-                len(result_items),
-                result.get("total"),
-                any(
-                    item
-                    and item.get("id") == "3P0Cuu6Dcnwk2rJpYM5C2S"
-                    for item in result_items
-                ),
-                cache_checksum,
-            )
-
+        result = await self._get_data(endpoint, **kwargs)
         await self.mass.cache.set(
-            cache_key,
-            result,
-            provider=self.instance_id,
-            checksum=cache_checksum,
+            cache_key, result, provider=self.instance_id, checksum=cache_checksum
         )
-
         return result
 
     @use_cache(120, allow_bypass=False)  # short cache: repeated traversals reuse metadata

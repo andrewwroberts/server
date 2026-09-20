@@ -1539,200 +1539,62 @@ class MusicProvider(Provider):
     async def _sync_library_playlists(self) -> set[int]:
         """Sync Library Playlists to Music Assistant library."""
         self.logger.debug("Start sync of Playlists to Music Assistant library.")
-
         conf_sync_playlist_tracks = self.config.get_value(
             CONF_ENTRY_LIBRARY_SYNC_PLAYLIST_TRACKS.key,
             CONF_ENTRY_LIBRARY_SYNC_PLAYLIST_TRACKS.default_value,
         )
         conf_sync_playlist_tracks = cast("list[str]", conf_sync_playlist_tracks)
-
         cur_db_ids: set[int] = set()
         item_count = 0
-
         async for prov_item in self.get_library_playlists():
             item_count += 1
-            self._update_sync_task_item_status(
-                MediaType.PLAYLIST,
-                item_count,
-                prov_item.name,
-            )
-
-            diag_target = (
-                self.domain == "spotify"
-                and prov_item.item_id == "3P0Cuu6Dcnwk2rJpYM5C2S"
-            )
-
-            if diag_target:
-                self.logger.warning(
-                    "SPOTIFY_PLAYLIST_DIAG "
-                    "target_received_by_library_sync "
-                    "id=%s name=%r uri=%s",
-                    prov_item.item_id,
-                    prov_item.name,
-                    prov_item.uri,
-                )
-
+            self._update_sync_task_item_status(MediaType.PLAYLIST, item_count, prov_item.name)
             db_id: int | None = None
-
             try:
-                library_item = (
-                    await self.mass.music.playlists
-                    .get_library_item_by_prov_mappings(
-                        prov_item.provider_mappings,
-                    )
+                library_item = await self.mass.music.playlists.get_library_item_by_prov_mappings(
+                    prov_item.provider_mappings,
                 )
-
                 db_id = int(library_item.item_id) if library_item else None
-
-                if diag_target:
-                    self.logger.warning(
-                        "SPOTIFY_PLAYLIST_DIAG "
-                        "target_existing_lookup "
-                        "existing=%s db_id=%s library_name=%r "
-                        "library_owner=%r favorite=%r mappings=%r",
-                        library_item is not None,
-                        db_id,
-                        library_item.name if library_item else None,
-                        getattr(library_item, "owner", None)
-                        if library_item
-                        else None,
-                        library_item.favorite
-                        if library_item
-                        else None,
-                        (
-                            [
-                                (
-                                    mapping.provider_instance,
-                                    mapping.item_id,
-                                    mapping.in_library,
-                                )
-                                for mapping in library_item.provider_mappings
-                            ]
-                            if library_item
-                            else []
-                        ),
-                    )
-
+                # batch all writes for this item into a single commit
                 async with self.mass.music.database.deferred_commit():
+                    # Every item yielded by get_library_playlists() is currently in the
+                    # provider library, so keep that state current before adding/updating it.
+                    for prov_map in prov_item.provider_mappings:
+                        prov_map.in_library = True
                     if not library_item:
-                        if diag_target:
-                            self.logger.warning(
-                                "SPOTIFY_PLAYLIST_DIAG target_action=add"
-                            )
-
-                        for prov_map in prov_item.provider_mappings:
-                            prov_map.in_library = True
-
-                        library_item = (
-                            await self.mass.music.playlists
-                            .add_item_to_library(prov_item)
+                        # add item to the library
+                        library_item = await self.mass.music.playlists.add_item_to_library(
+                            prov_item
                         )
-
-                    elif (
-                        self._library_item_needs_update(
-                            library_item,
-                            prov_item,
+                    elif prov_item.is_dynamic and not library_item.is_editable:
+                        # the provider is the sole source of truth for non-editable dynamic
+                        # playlists (e.g. Pandora/personalized-radio stations): overwrite=True
+                        # replaces the full stored record, which is fine here since there's no
+                        # local customization on these to lose.
+                        library_item = await self.mass.music.playlists.update_item_in_library(
+                            library_item.item_id, prov_item, overwrite=True
                         )
-                        or prov_item.supported_mediatypes
-                        != library_item.supported_mediatypes
-                    ):
-                        if diag_target:
-                            self.logger.warning(
-                                "SPOTIFY_PLAYLIST_DIAG target_action=update"
-                            )
-
-                        library_item = (
-                            await self.mass.music.playlists
-                            .update_item_in_library(
-                                library_item.item_id,
-                                prov_item,
-                            )
+                    else:
+                        # Reconcile every existing provider playlist on every library sync.
+                        # PlaylistController preserves locally-editable names while allowing
+                        # non-editable/followed playlists to adopt the provider's current name.
+                        library_item = await self.mass.music.playlists.update_item_in_library(
+                            library_item.item_id, prov_item
                         )
-
-                    elif (
-                        prov_item.is_dynamic
-                        and not library_item.is_editable
-                        and (
-                            prov_item.name != library_item.name
-                            or prov_item.metadata.images
-                            != library_item.metadata.images
-                        )
-                    ):
-                        if diag_target:
-                            self.logger.warning(
-                                "SPOTIFY_PLAYLIST_DIAG "
-                                "target_action=dynamic_overwrite"
-                            )
-
-                        library_item = (
-                            await self.mass.music.playlists
-                            .update_item_in_library(
-                                library_item.item_id,
-                                prov_item,
-                                overwrite=True,
-                            )
-                        )
-
-                    elif diag_target:
-                        self.logger.warning(
-                            "SPOTIFY_PLAYLIST_DIAG "
-                            "target_action=no_update_needed"
-                        )
-
                     db_id = int(library_item.item_id)
                     cur_db_ids.add(db_id)
-
-                    if diag_target:
-                        self.logger.warning(
-                            "SPOTIFY_PLAYLIST_DIAG "
-                            "target_library_write_ok "
-                            "db_id=%s favorite=%s mappings=%r",
-                            db_id,
-                            library_item.favorite,
-                            [
-                                (
-                                    mapping.provider_instance,
-                                    mapping.item_id,
-                                    mapping.in_library,
-                                )
-                                for mapping in library_item.provider_mappings
-                            ],
-                        )
-
                     if not library_item.favorite and prov_item.favorite:
-                        await self.mass.music.playlists.set_favorite(
-                            library_item.item_id,
-                            True,
-                        )
-
-                await asyncio.sleep(0)
-
+                        # existing library item not favorite but should be
+                        await self.mass.music.playlists.set_favorite(library_item.item_id, True)
+                await asyncio.sleep(0)  # yield to eventloop
             except Exception as err:
-                if diag_target:
-                    self.logger.error(
-                        "SPOTIFY_PLAYLIST_DIAG "
-                        "target_library_write_failed "
-                        "id=%s error=%s",
-                        prov_item.item_id,
-                        err,
-                        exc_info=True,
-                    )
-
-                self._handle_sync_item_failure(
-                    MediaType.PLAYLIST,
-                    prov_item.uri,
-                    err,
-                )
-
+                self._handle_sync_item_failure(MediaType.PLAYLIST, prov_item.uri, err)
                 self._protect_failed_sync_item(
-                    MediaType.PLAYLIST,
-                    prov_item.item_id,
-                    db_id,
-                    cur_db_ids,
+                    MediaType.PLAYLIST, prov_item.item_id, db_id, cur_db_ids
                 )
-
                 continue
-
+            # optionally sync playlist tracks. the playlist is already collected here, so
+            # failing on its tracks does not make the playlist result set incomplete
             if (
                 prov_item.name in conf_sync_playlist_tracks
                 or prov_item.uri in conf_sync_playlist_tracks
@@ -1740,12 +1602,7 @@ class MusicProvider(Provider):
                 try:
                     await self._sync_playlist_tracks(prov_item)
                 except Exception as err:
-                    self._handle_sync_item_failure(
-                        MediaType.PLAYLIST,
-                        prov_item.uri,
-                        err,
-                    )
-
+                    self._handle_sync_item_failure(MediaType.PLAYLIST, prov_item.uri, err)
         return cur_db_ids
 
     async def _sync_playlist_tracks(self, provider_playlist: Playlist) -> None:

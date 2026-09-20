@@ -519,18 +519,13 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
         reachable_via = self._resolve_reachable_via(reachable_via)
         if reachable_via is not None and not reachable_via:
             return []
-        provider_filter = self._provider_filter_considering_reachability(
-            provider,
-            reachable_via,
-        )
-
         items = await self.get_library_items_by_query(
             favorite=favorite,
             search=search,
             limit=limit,
             offset=offset,
             order_by=order_by,
-            provider_filter=provider_filter,
+            provider_filter=self._provider_filter_considering_reachability(provider, reachable_via),
             genre_ids=genre,
             played_only=played_only,
             in_library_only=True,
@@ -538,54 +533,6 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
             collapse_collections=collapse_collections,
             reachable_via=reachable_via,
         )
-
-        if self.media_type == MediaType.PLAYLIST:
-            diag_target_id = "3P0Cuu6Dcnwk2rJpYM5C2S"
-
-            diag_matches = [
-                item
-                for item in items
-                if any(
-                    mapping.item_id == diag_target_id
-                    for mapping in item.provider_mappings
-                )
-            ]
-
-            self.logger.warning(
-                "SPOTIFY_PLAYLIST_LIST_DIAG "
-                "request favorite=%r search=%r limit=%s offset=%s "
-                "order_by=%r provider=%r provider_filter=%r "
-                "summary=%s count=%s target_returned=%s",
-                favorite,
-                search,
-                limit,
-                offset,
-                order_by,
-                provider,
-                provider_filter,
-                summary,
-                len(items),
-                bool(diag_matches),
-            )
-
-            for diag_item in diag_matches:
-                self.logger.warning(
-                    "SPOTIFY_PLAYLIST_LIST_DIAG "
-                    "target_result db_id=%s name=%r owner=%r "
-                    "favorite=%s mappings=%r",
-                    diag_item.item_id,
-                    diag_item.name,
-                    getattr(diag_item, "owner", None),
-                    diag_item.favorite,
-                    [
-                        (
-                            mapping.provider_instance,
-                            mapping.item_id,
-                            mapping.in_library,
-                        )
-                        for mapping in diag_item.provider_mappings
-                    ],
-                )
         if (
             kwargs.get("_localized_fallback", True)
             and search
