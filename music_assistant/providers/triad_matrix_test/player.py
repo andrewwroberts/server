@@ -99,21 +99,88 @@ class TriadMatrixTestPlayer(Player):
             return
 
         raw_state = state.get("state")
-        attrs = state.get("attributes", {})
         bus = self._prov.get_bus_for_owner(self.player_id)
-        backend = self._prov.get_backend_player(bus, required=False) if bus is not None else None
-
-        self._attr_available = raw_state not in ("unavailable", "unknown", None) and (
-            backend is not None if bus is not None else self._prov.has_available_backend()
+        backend = (
+            self._prov.get_backend_player(
+                bus,
+                required=False,
+            )
+            if bus is not None
+            else None
         )
-        self._attr_powered = raw_state != "off"
 
-        volume = attrs.get("volume_level")
-        if isinstance(volume, int | float):
-            self._attr_volume_level = round(float(volume) * 100)
+        control_state = state
 
-        muted = attrs.get("is_volume_muted")
-        if isinstance(muted, bool):
+        if self._prov.is_theater_player(self):
+            try:
+                control_state = (
+                    await self._prov.get_room_control_state(
+                        self
+                    )
+                )
+            except Exception as err:
+                self._prov.logger.debug(
+                    "Unable to poll Theater Denon "
+                    "control state for %s: %s",
+                    self.display_name,
+                    err,
+                )
+                self._attr_available = False
+                self.update_state()
+                return
+
+        control_raw_state = control_state.get(
+            "state"
+        )
+        control_attrs = control_state.get(
+            "attributes",
+            {},
+        )
+
+        self._attr_available = (
+            raw_state
+            not in (
+                "unavailable",
+                "unknown",
+                None,
+            )
+            and control_raw_state
+            not in (
+                "unavailable",
+                "unknown",
+                None,
+            )
+            and (
+                backend is not None
+                if bus is not None
+                else self._prov.has_available_backend()
+            )
+        )
+
+        # The logical music power state continues to follow
+        # the Triad route. The Denon can remain on for video.
+        self._attr_powered = (
+            raw_state != "off"
+        )
+
+        volume = control_attrs.get(
+            "volume_level"
+        )
+        if isinstance(
+            volume,
+            int | float,
+        ):
+            self._attr_volume_level = round(
+                float(volume) * 100
+            )
+
+        muted = control_attrs.get(
+            "is_volume_muted"
+        )
+        if isinstance(
+            muted,
+            bool,
+        ):
             self._attr_volume_muted = muted
 
         if backend is not None:
@@ -305,7 +372,7 @@ class TriadMatrixTestPlayer(Player):
         self.update_state()
 
     async def volume_set(self, volume_level: int) -> None:
-        """Set the volume of this Triad output only."""
+        """Set the user-facing room volume."""
         volume_level = max(0, min(100, volume_level))
 
         await self._prov.set_zone_volume(
@@ -317,7 +384,7 @@ class TriadMatrixTestPlayer(Player):
         self.update_state()
 
     async def volume_mute(self, muted: bool) -> None:
-        """Mute or unmute this Triad output only."""
+        """Mute or unmute the user-facing room output."""
         await self._prov.set_zone_mute(
             self,
             muted,

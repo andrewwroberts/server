@@ -18,6 +18,11 @@ from music_assistant.providers.triad_matrix_test.player import TriadMatrixTestPl
 from music_assistant.providers.triad_matrix_test.provider import (
     BUS_DEFINITIONS,
     ROOMS,
+    THEATER_AVR_ENTITY,
+    THEATER_AVR_SOURCE,
+    THEATER_AVR_SOURCE_COMMAND,
+    THEATER_FEED_VOLUME,
+    THEATER_PLAYER_ID,
     MatrixBus,
     TriadMatrixTestProvider,
 )
@@ -56,6 +61,7 @@ def _provider(
                 player_id=player_id,
                 display_name=str(room["name"]),
                 zone_entity=str(room["entity_id"]),
+                output_number=int(room["output"]),
                 state=SimpleNamespace(
                     playback_state=PlaybackState.IDLE,
                     synced_to=None,
@@ -1648,3 +1654,495 @@ async def test_ad_hoc_leader_transfer_preserves_remaining_group_and_queue() -> N
             new_leader_id,
         ),
     ]
+
+
+
+async def test_theater_room_documents_hybrid_denon_path() -> None:
+    """Theater Output 9 terminates at the Denon CD input."""
+    assert ROOMS[THEATER_PLAYER_ID]["output"] == 9
+    assert (
+        ROOMS[THEATER_PLAYER_ID]["entity_id"]
+        == "media_player.triad_theater_room"
+    )
+    assert (
+        THEATER_AVR_ENTITY
+        == "media_player.denon_avr_x4000"
+    )
+    assert THEATER_AVR_SOURCE == "CD"
+    assert THEATER_AVR_SOURCE_COMMAND.endswith(
+        "SICD"
+    )
+    assert THEATER_FEED_VOLUME == 100
+
+
+async def test_verified_hass_command_uses_denonavr_domain() -> None:
+    """Generic verifier must preserve the requested HA domain."""
+    provider = _provider()
+
+    call_service = AsyncMock()
+
+    provider.get_hass_provider = MagicMock(
+        return_value=SimpleNamespace(
+            hass=SimpleNamespace(
+                call_service=call_service,
+            )
+        )
+    )
+
+    provider.get_zone_state = AsyncMock(
+        return_value={
+            "entity_id": THEATER_AVR_ENTITY,
+            "state": "on",
+            "attributes": {
+                "source": "CD",
+            },
+        }
+    )
+
+    state = await provider._verified_hass_command(
+        domain="denonavr",
+        entity_id=THEATER_AVR_ENTITY,
+        service="get_command",
+        service_data={
+            "command": THEATER_AVR_SOURCE_COMMAND,
+        },
+        verifier=lambda candidate: (
+            (
+                candidate.get("attributes")
+                or {}
+            ).get("source")
+            == "CD"
+        ),
+        description="test Denon CD",
+        attempts=1,
+    )
+
+    call_service.assert_awaited_once_with(
+        domain="denonavr",
+        service="get_command",
+        target={
+            "entity_id": THEATER_AVR_ENTITY,
+        },
+        service_data={
+            "command": THEATER_AVR_SOURCE_COMMAND,
+        },
+    )
+
+    assert (
+        state["attributes"]["source"]
+        == "CD"
+    )
+
+
+async def test_prepare_theater_sink_powers_denon_and_selects_cd() -> None:
+    """Theater playback prepares the actual speaker amplifier."""
+    provider = _provider()
+
+    theater = provider.get_room_player(
+        THEATER_PLAYER_ID
+    )
+    assert theater is not None
+
+    provider.get_zone_state = AsyncMock(
+        return_value={
+            "entity_id": THEATER_AVR_ENTITY,
+            "state": "off",
+            "attributes": {
+                "source": "AUX2",
+            },
+        }
+    )
+
+    power = AsyncMock(
+        return_value={
+            "entity_id": THEATER_AVR_ENTITY,
+            "state": "on",
+            "attributes": {
+                "source": "AUX2",
+            },
+        }
+    )
+
+    source = AsyncMock(
+        return_value={
+            "entity_id": THEATER_AVR_ENTITY,
+            "state": "on",
+            "attributes": {
+                "source": "CD",
+            },
+        }
+    )
+
+    provider._verified_media_player_command = power
+    provider._verified_hass_command = source
+
+    await provider.prepare_room_sink(
+        theater
+    )
+
+    power.assert_awaited_once()
+
+    assert (
+        power.await_args.kwargs["entity_id"]
+        == THEATER_AVR_ENTITY
+    )
+    assert (
+        power.await_args.kwargs["service"]
+        == "turn_on"
+    )
+
+    source.assert_awaited_once()
+
+    assert (
+        source.await_args.kwargs["domain"]
+        == "denonavr"
+    )
+    assert (
+        source.await_args.kwargs["entity_id"]
+        == THEATER_AVR_ENTITY
+    )
+    assert (
+        source.await_args.kwargs["service"]
+        == "get_command"
+    )
+    assert (
+        source.await_args.kwargs["service_data"]
+        == {
+            "command": THEATER_AVR_SOURCE_COMMAND,
+        }
+    )
+
+
+async def test_theater_route_prepares_avr_and_fixes_output_9_feed() -> None:
+    """Theater routing keeps Output 9 at fixed source level."""
+    provider = _provider()
+
+    theater = provider.get_room_player(
+        THEATER_PLAYER_ID
+    )
+    assert theater is not None
+
+    bus = provider._buses[0]
+    bus.owner_id = THEATER_PLAYER_ID
+
+    provider.get_zone_state = AsyncMock(
+        return_value={
+            "entity_id": theater.zone_entity,
+            "state": "off",
+            "attributes": {
+                "source": None,
+            },
+        }
+    )
+
+    prepare_sink = AsyncMock()
+    provider.prepare_room_sink = prepare_sink
+
+    verified = AsyncMock(
+        side_effect=[
+            {
+                "entity_id": theater.zone_entity,
+                "state": "on",
+                "attributes": {
+                    "source": bus.source_name,
+                    "volume_level": 0.25,
+                    "is_volume_muted": True,
+                },
+            },
+            {
+                "entity_id": theater.zone_entity,
+                "state": "on",
+                "attributes": {
+                    "source": bus.source_name,
+                    "volume_level": 1.0,
+                    "is_volume_muted": True,
+                },
+            },
+            {
+                "entity_id": theater.zone_entity,
+                "state": "on",
+                "attributes": {
+                    "source": bus.source_name,
+                    "volume_level": 1.0,
+                    "is_volume_muted": False,
+                },
+            },
+        ]
+    )
+
+    provider._verified_media_player_command = verified
+
+    await provider.route_zone_to_bus(
+        theater,
+        bus,
+    )
+
+    prepare_sink.assert_awaited_once_with(
+        theater
+    )
+
+    assert verified.await_count == 3
+
+    route_call = verified.await_args_list[0]
+    volume_call = verified.await_args_list[1]
+    mute_call = verified.await_args_list[2]
+
+    assert (
+        route_call.kwargs["service"]
+        == "select_source"
+    )
+    assert (
+        route_call.kwargs["service_data"]
+        == {
+            "source": bus.source_name,
+        }
+    )
+
+    assert (
+        volume_call.kwargs["service"]
+        == "volume_set"
+    )
+    assert (
+        volume_call.kwargs["service_data"]
+        == {
+            "volume_level": 1.0,
+        }
+    )
+
+    assert (
+        mute_call.kwargs["service"]
+        == "volume_mute"
+    )
+    assert (
+        mute_call.kwargs["service_data"]
+        == {
+            "is_volume_muted": False,
+        }
+    )
+
+
+async def test_normal_room_route_does_not_prepare_denon() -> None:
+    """The twelve ordinary Triad rooms retain old routing behavior."""
+    provider = _provider()
+
+    player_id = next(
+        candidate
+        for candidate in ROOMS
+        if candidate != THEATER_PLAYER_ID
+    )
+
+    room = provider.get_room_player(
+        player_id
+    )
+    assert room is not None
+
+    bus = provider._buses[0]
+    bus.owner_id = player_id
+
+    provider.get_zone_state = AsyncMock(
+        return_value={
+            "entity_id": room.zone_entity,
+            "state": "off",
+            "attributes": {
+                "source": None,
+            },
+        }
+    )
+
+    prepare_sink = AsyncMock()
+    provider.prepare_room_sink = prepare_sink
+
+    verified = AsyncMock(
+        return_value={
+            "entity_id": room.zone_entity,
+            "state": "on",
+            "attributes": {
+                "source": bus.source_name,
+            },
+        }
+    )
+
+    provider._verified_media_player_command = verified
+
+    await provider.route_zone_to_bus(
+        room,
+        bus,
+    )
+
+    prepare_sink.assert_not_awaited()
+
+    verified.assert_awaited_once()
+
+    assert (
+        verified.await_args.kwargs["entity_id"]
+        == room.zone_entity
+    )
+    assert (
+        verified.await_args.kwargs["service"]
+        == "select_source"
+    )
+
+
+async def test_theater_volume_and_mute_target_denon() -> None:
+    """Theater MA controls operate the receiver, not Output 9."""
+    provider = _provider()
+
+    theater = provider.get_room_player(
+        THEATER_PLAYER_ID
+    )
+    assert theater is not None
+
+    verified = AsyncMock(
+        return_value={}
+    )
+
+    provider._verified_media_player_command = verified
+
+    await provider.set_zone_volume(
+        theater,
+        42,
+    )
+
+    await provider.set_zone_mute(
+        theater,
+        True,
+    )
+
+    assert verified.await_count == 2
+
+    volume_call = verified.await_args_list[0]
+    mute_call = verified.await_args_list[1]
+
+    assert (
+        volume_call.kwargs["entity_id"]
+        == THEATER_AVR_ENTITY
+    )
+    assert (
+        volume_call.kwargs["service"]
+        == "volume_set"
+    )
+    assert (
+        volume_call.kwargs["service_data"]
+        == {
+            "volume_level": 0.42,
+        }
+    )
+
+    assert (
+        mute_call.kwargs["entity_id"]
+        == THEATER_AVR_ENTITY
+    )
+    assert (
+        mute_call.kwargs["service"]
+        == "volume_mute"
+    )
+    assert (
+        mute_call.kwargs["service_data"]
+        == {
+            "is_volume_muted": True,
+        }
+    )
+
+
+async def test_theater_poll_reports_denon_volume_and_mute() -> None:
+    """Logical Theater volume and mute mirror the Denon."""
+    provider = _provider()
+    room = ROOMS[THEATER_PLAYER_ID]
+
+    provider.get_zone_state = AsyncMock(
+        return_value={
+            "entity_id": room["entity_id"],
+            "state": "off",
+            "attributes": {
+                "volume_level": 1.0,
+                "is_volume_muted": False,
+            },
+        }
+    )
+
+    provider.get_room_control_state = AsyncMock(
+        return_value={
+            "entity_id": THEATER_AVR_ENTITY,
+            "state": "off",
+            "attributes": {
+                "volume_level": 0.56,
+                "is_volume_muted": True,
+                "source": "CD",
+            },
+        }
+    )
+
+    theater = TriadMatrixTestPlayer.__new__(
+        TriadMatrixTestPlayer
+    )
+
+    theater._provider = provider
+    theater.mass = provider.mass
+    theater._player_id = THEATER_PLAYER_ID
+    theater._attr_name = "Theater Room"
+    theater.zone_entity = str(
+        room["entity_id"]
+    )
+    theater.output_number = int(
+        room["output"]
+    )
+    theater._attr_available = False
+    theater._attr_powered = False
+    theater._attr_volume_level = None
+    theater._attr_volume_muted = None
+    theater._intentional_pause = False
+    theater.update_state = MagicMock()
+
+    await theater.poll()
+
+    provider.get_room_control_state.assert_awaited_once_with(
+        theater
+    )
+
+    assert theater._attr_available is True
+    assert theater._attr_powered is False
+    assert theater._attr_volume_level == 56
+    assert theater._attr_volume_muted is True
+
+
+async def test_theater_disconnect_does_not_power_off_denon() -> None:
+    """Stopping Theater music disconnects Output 9 only."""
+    provider = _provider()
+
+    theater = provider.get_room_player(
+        THEATER_PLAYER_ID
+    )
+    assert theater is not None
+
+    verified = AsyncMock(
+        return_value={
+            "entity_id": theater.zone_entity,
+            "state": "off",
+            "attributes": {
+                "source": None,
+            },
+        }
+    )
+
+    provider._verified_media_player_command = verified
+
+    await provider.turn_off_zone(
+        theater
+    )
+
+    verified.assert_awaited_once()
+
+    call = verified.await_args
+
+    assert (
+        call.kwargs["entity_id"]
+        == theater.zone_entity
+    )
+    assert (
+        call.kwargs["service"]
+        == "turn_off"
+    )
+    assert (
+        call.kwargs["entity_id"]
+        != THEATER_AVR_ENTITY
+    )

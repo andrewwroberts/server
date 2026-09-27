@@ -74,6 +74,16 @@ BUS_DEFINITIONS = (
     ),
 )
 
+# Theater Room is physically different from the other Triad zones.
+# AMS16 Output 9 is a fixed-level analog feed into the Denon AVR-X4000
+# CD input. The Denon drives the Theater surround speakers and therefore
+# owns the user-facing Theater volume and mute state.
+THEATER_PLAYER_ID = "triad_test_theater_room"
+THEATER_AVR_ENTITY = "media_player.denon_avr_x4000"
+THEATER_AVR_SOURCE = "CD"
+THEATER_AVR_SOURCE_COMMAND = "/goform/formiPhoneAppDirect.xml?SICD"
+THEATER_FEED_VOLUME = 100
+
 ROOMS: dict[str, RoomDefinition] = {
     "triad_test_master_shower": {
         "name": "Master Shower",
@@ -292,6 +302,113 @@ class TriadMatrixTestProvider(PlayerProvider):
             kwargs["service_data"] = service_data
 
         await hass_provider.hass.call_service(**kwargs)
+
+    async def _verified_hass_command(
+        self,
+        *,
+        domain: str,
+        entity_id: str,
+        service: str,
+        service_data: dict[str, Any] | None,
+        verifier: Callable[[dict[str, Any]], bool],
+        description: str,
+        attempts: int = 5,
+    ) -> dict[str, Any]:
+        """Run and verify a HA service outside the media_player domain."""
+        hass_provider = self.get_hass_provider()
+        last_state: dict[str, Any] | None = None
+        last_error: Exception | None = None
+
+        for attempt in range(1, attempts + 1):
+            try:
+                kwargs: dict[str, Any] = {
+                    "domain": domain,
+                    "service": service,
+                    "target": {
+                        "entity_id": entity_id,
+                    },
+                }
+
+                if service_data is not None:
+                    kwargs["service_data"] = service_data
+
+                await hass_provider.hass.call_service(
+                    **kwargs
+                )
+
+                await asyncio.sleep(0.35)
+
+                last_state = await self.get_zone_state(
+                    entity_id
+                )
+
+                if verifier(last_state):
+                    if attempt > 1:
+                        self.logger.info(
+                            "TRIAD VERIFY: %s succeeded "
+                            "on attempt %d",
+                            description,
+                            attempt,
+                        )
+
+                    return last_state
+
+                self.logger.warning(
+                    "TRIAD VERIFY: %s not confirmed "
+                    "on attempt %d/%d",
+                    description,
+                    attempt,
+                    attempts,
+                )
+
+            except Exception as err:
+                last_error = err
+
+                self.logger.warning(
+                    "TRIAD VERIFY: %s raised "
+                    "on attempt %d/%d: %s",
+                    description,
+                    attempt,
+                    attempts,
+                    err,
+                )
+
+            if attempt < attempts:
+                await asyncio.sleep(0.35)
+
+        detail = (
+            f"last_state={last_state!r}"
+            if last_state is not None
+            else f"last_error={last_error!r}"
+        )
+
+        raise PlayerCommandFailed(
+            "Triad command could not be verified "
+            f"after {attempts} attempts: "
+            f"{description}; {detail}"
+        )
+
+    def is_theater_player(
+        self,
+        player: TriadMatrixTestPlayer,
+    ) -> bool:
+        """Return whether this is the hybrid Triad/Denon Theater zone."""
+        return player.player_id == THEATER_PLAYER_ID
+
+    async def get_room_control_state(
+        self,
+        player: TriadMatrixTestPlayer,
+    ) -> dict[str, Any]:
+        """Return the entity owning user-facing volume and mute."""
+        entity_id = (
+            THEATER_AVR_ENTITY
+            if self.is_theater_player(player)
+            else player.zone_entity
+        )
+
+        return await self.get_zone_state(
+            entity_id
+        )
 
     async def get_zone_state(self, entity_id: str) -> dict[str, Any]:
         """Return current state of a Triad HA media_player."""
@@ -895,6 +1012,121 @@ class TriadMatrixTestProvider(PlayerProvider):
             f"state={backend.state.playback_state.value}."
         )
 
+    async def prepare_room_sink(
+        self,
+        player: TriadMatrixTestPlayer,
+    ) -> None:
+        """Prepare any downstream amplifier required by a logical room."""
+        if not self.is_theater_player(player):
+            return
+
+        state = await self.get_zone_state(
+            THEATER_AVR_ENTITY
+        )
+
+        if state.get("state") != "on":
+            self.logger.info(
+                "TRIAD THEATER AVR POWER: turning on %s",
+                THEATER_AVR_ENTITY,
+            )
+
+            state = await self._verified_media_player_command(
+                entity_id=THEATER_AVR_ENTITY,
+                service="turn_on",
+                service_data=None,
+                verifier=lambda new_state: (
+                    new_state.get("state") == "on"
+                ),
+                description="power on Theater Denon AVR",
+                attempts=20,
+            )
+
+        current_source = (
+            state.get("attributes") or {}
+        ).get("source")
+
+        if current_source != THEATER_AVR_SOURCE:
+            self.logger.info(
+                "TRIAD THEATER AVR SOURCE: %s -> %s",
+                current_source,
+                THEATER_AVR_SOURCE,
+            )
+
+            await self._verified_hass_command(
+                domain="denonavr",
+                entity_id=THEATER_AVR_ENTITY,
+                service="get_command",
+                service_data={
+                    "command": THEATER_AVR_SOURCE_COMMAND,
+                },
+                verifier=lambda new_state: (
+                    (
+                        new_state.get("attributes")
+                        or {}
+                    ).get("source")
+                    == THEATER_AVR_SOURCE
+                ),
+                description="select Theater Denon CD input",
+                attempts=20,
+            )
+
+    async def _ensure_theater_feed_level(
+        self,
+        player: TriadMatrixTestPlayer,
+        state: dict[str, Any],
+    ) -> None:
+        """Keep Output 9 at fixed 100% unmuted source level."""
+        if not self.is_theater_player(player):
+            return
+
+        expected = THEATER_FEED_VOLUME / 100
+
+        if not self._volume_matches(
+            state,
+            expected,
+        ):
+            state = await self._verified_media_player_command(
+                entity_id=player.zone_entity,
+                service="volume_set",
+                service_data={
+                    "volume_level": expected,
+                },
+                verifier=lambda new_state: (
+                    self._volume_matches(
+                        new_state,
+                        expected,
+                    )
+                ),
+                description=(
+                    "set Theater Triad Output 9 "
+                    "fixed feed to 100%"
+                ),
+            )
+
+        muted = (
+            state.get("attributes") or {}
+        ).get("is_volume_muted")
+
+        if muted is not False:
+            await self._verified_media_player_command(
+                entity_id=player.zone_entity,
+                service="volume_mute",
+                service_data={
+                    "is_volume_muted": False,
+                },
+                verifier=lambda new_state: (
+                    (
+                        new_state.get("attributes")
+                        or {}
+                    ).get("is_volume_muted")
+                    is False
+                ),
+                description=(
+                    "unmute Theater Triad Output 9 "
+                    "fixed feed"
+                ),
+            )
+
     async def route_zone_to_bus(
         self,
         player: TriadMatrixTestPlayer,
@@ -903,15 +1135,35 @@ class TriadMatrixTestProvider(PlayerProvider):
         """Route one Triad output to a reserved source bus."""
         if bus.owner_id is None:
             raise PlayerCommandFailed(
-                f"Cannot route {player.display_name}: {bus.source_name} is not reserved."
+                f"Cannot route {player.display_name}: "
+                f"{bus.source_name} is not reserved."
             )
 
-        state = await self.get_zone_state(player.zone_entity)
-        current_source = (state.get("attributes") or {}).get("source")
-        if current_source not in (None, bus.source_name):
+        state = await self.get_zone_state(
+            player.zone_entity
+        )
+
+        current_source = (
+            state.get("attributes") or {}
+        ).get("source")
+
+        if current_source not in (
+            None,
+            bus.source_name,
+        ):
             raise PlayerCommandFailed(
-                f"Refusing to reroute {player.display_name} from "
-                f"{current_source} to {bus.source_name}."
+                f"Refusing to reroute "
+                f"{player.display_name} from "
+                f"{current_source} to "
+                f"{bus.source_name}."
+            )
+
+        # Output 9 feeds the Denon rather than directly
+        # driving Theater speakers. Prepare it only after
+        # the existing matrix route safety check passes.
+        if self.is_theater_player(player):
+            await self.prepare_room_sink(
+                player
             )
 
         self.logger.info(
@@ -922,17 +1174,37 @@ class TriadMatrixTestProvider(PlayerProvider):
             bus.definition.triad_input,
         )
 
-        await self._verified_media_player_command(
+        routed_state = await self._verified_media_player_command(
             entity_id=player.zone_entity,
             service="select_source",
-            service_data={"source": bus.source_name},
+            service_data={
+                "source": bus.source_name,
+            },
             verifier=lambda new_state: (
-                new_state.get("state") not in ("off", "unavailable", "unknown", None)
-                and (new_state.get("attributes") or {}).get("source") == bus.source_name
+                new_state.get("state")
+                not in (
+                    "off",
+                    "unavailable",
+                    "unknown",
+                    None,
+                )
+                and (
+                    new_state.get("attributes")
+                    or {}
+                ).get("source")
+                == bus.source_name
             ),
             description=(
-                f"route {player.display_name} output {player.output_number} to {bus.source_name}"
+                f"route {player.display_name} "
+                f"output {player.output_number} "
+                f"to {bus.source_name}"
             ),
+        )
+
+        # For Theater only, Output 9 is a line-level feed.
+        await self._ensure_theater_feed_level(
+            player,
+            routed_state,
         )
 
     async def turn_off_zone(self, player: TriadMatrixTestPlayer) -> None:
@@ -959,17 +1231,49 @@ class TriadMatrixTestProvider(PlayerProvider):
         player: TriadMatrixTestPlayer,
         volume_level: int,
     ) -> None:
-        """Set one Triad output volume and verify the resulting level."""
-        expected = max(0, min(100, volume_level)) / 100
+        """Set user-facing room volume and verify the resulting level."""
+        expected = (
+            max(
+                0,
+                min(100, volume_level),
+            )
+            / 100
+        )
+
+        theater = self.is_theater_player(
+            player
+        )
+
+        entity_id = (
+            THEATER_AVR_ENTITY
+            if theater
+            else player.zone_entity
+        )
+
+        description = (
+            f"set Theater Denon AVR "
+            f"volume to {volume_level}%"
+            if theater
+            else (
+                f"set {player.display_name} "
+                f"output {player.output_number} "
+                f"volume to {volume_level}%"
+            )
+        )
 
         await self._verified_media_player_command(
-            entity_id=player.zone_entity,
+            entity_id=entity_id,
             service="volume_set",
-            service_data={"volume_level": expected},
-            verifier=lambda state: self._volume_matches(state, expected),
-            description=(
-                f"set {player.display_name} output {player.output_number} volume to {volume_level}%"
+            service_data={
+                "volume_level": expected,
+            },
+            verifier=lambda state: (
+                self._volume_matches(
+                    state,
+                    expected,
+                )
             ),
+            description=description,
         )
 
     async def set_zone_mute(
@@ -977,13 +1281,42 @@ class TriadMatrixTestProvider(PlayerProvider):
         player: TriadMatrixTestPlayer,
         muted: bool,
     ) -> None:
-        """Set one Triad output mute state and verify it."""
+        """Set user-facing room mute state and verify it."""
+        theater = self.is_theater_player(
+            player
+        )
+
+        entity_id = (
+            THEATER_AVR_ENTITY
+            if theater
+            else player.zone_entity
+        )
+
+        description = (
+            f"set Theater Denon AVR "
+            f"muted={muted}"
+            if theater
+            else (
+                f"set {player.display_name} "
+                f"output {player.output_number} "
+                f"muted={muted}"
+            )
+        )
+
         await self._verified_media_player_command(
-            entity_id=player.zone_entity,
+            entity_id=entity_id,
             service="volume_mute",
-            service_data={"is_volume_muted": muted},
-            verifier=lambda state: (state.get("attributes") or {}).get("is_volume_muted") is muted,
-            description=(f"set {player.display_name} output {player.output_number} muted={muted}"),
+            service_data={
+                "is_volume_muted": muted,
+            },
+            verifier=lambda state: (
+                (
+                    state.get("attributes")
+                    or {}
+                ).get("is_volume_muted")
+                is muted
+            ),
+            description=description,
         )
 
     async def _get_zone_states(
