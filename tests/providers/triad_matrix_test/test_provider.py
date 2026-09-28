@@ -344,6 +344,112 @@ async def test_requested_room_active_route_on_other_bus_refuses_claim() -> None:
     assert all(bus.owner_id is None for bus in provider._buses)
 
 
+async def test_requested_room_non_ma_source_allows_claim() -> None:
+    """An explicit MA request may take over a room from a non-MA source."""
+    provider = _provider()
+    owner_id = list(ROOMS)[-1]
+
+    owner = _set_route(provider, owner_id, "Input 2")
+
+    bus, _ = await provider.claim_bus(
+        owner_id,
+        [owner_id],
+    )
+
+    assert bus.source_name == "Connect 1"
+    assert bus.owner_id == owner_id
+
+    states = provider._get_zone_states.return_value  # type: ignore[attr-defined]
+    assert (
+        states[owner.zone_entity]["attributes"]["source"]
+        == "Input 2"
+    )
+
+
+async def test_route_zone_to_bus_allows_non_ma_source_takeover() -> None:
+    """Routing may replace the selected room's existing non-MA source."""
+    provider = _provider()
+    owner_id = list(ROOMS)[-1]
+    owner = provider.get_room_player(owner_id)
+    assert owner is not None
+
+    bus = provider._buses[0]
+    bus.owner_id = owner_id
+
+    provider.get_zone_state = AsyncMock(
+        return_value={
+            "entity_id": owner.zone_entity,
+            "state": "on",
+            "attributes": {
+                "source": "Input 2",
+            },
+        }
+    )
+
+    verified = AsyncMock(
+        return_value={
+            "entity_id": owner.zone_entity,
+            "state": "on",
+            "attributes": {
+                "source": bus.source_name,
+            },
+        }
+    )
+    provider._verified_media_player_command = verified
+
+    await provider.route_zone_to_bus(
+        owner,
+        bus,
+    )
+
+    verified.assert_awaited_once()
+    assert (
+        verified.await_args.kwargs["service"]
+        == "select_source"
+    )
+    assert (
+        verified.await_args.kwargs["service_data"]
+        == {
+            "source": "Connect 1",
+        }
+    )
+
+
+async def test_route_zone_to_bus_still_refuses_other_ma_bus() -> None:
+    """A late cross-MA-bus route remains protected against bus stealing."""
+    provider = _provider()
+    owner_id = list(ROOMS)[-1]
+    owner = provider.get_room_player(owner_id)
+    assert owner is not None
+
+    bus = provider._buses[0]
+    bus.owner_id = owner_id
+
+    provider.get_zone_state = AsyncMock(
+        return_value={
+            "entity_id": owner.zone_entity,
+            "state": "on",
+            "attributes": {
+                "source": "Connect 2",
+            },
+        }
+    )
+
+    verified = AsyncMock()
+    provider._verified_media_player_command = verified
+
+    with pytest.raises(
+        PlayerCommandFailed,
+        match="Refusing to reroute",
+    ):
+        await provider.route_zone_to_bus(
+            owner,
+            bus,
+        )
+
+    verified.assert_not_awaited()
+
+
 async def test_owned_idle_session_with_paused_backend_is_reclaimable() -> None:
     """An idle logical owner may release an ended paused backend."""
     provider = _provider(

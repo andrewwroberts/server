@@ -771,10 +771,10 @@ class TriadMatrixTestProvider(PlayerProvider):
                     None,
                 )
                 if routed_bus is None:
-                    raise PlayerCommandFailed(
-                        f"Refusing to reroute {member.display_name} from unexpected "
-                        f"source {source}; no source bus was claimed."
-                    )
+                    # An explicit MA play/group request owns the selected room.
+                    # Non-MA matrix sources are therefore takeover-eligible.
+                    # Only an existing MA bus route needs reconciliation.
+                    continue
 
                 if routed_bus.owner_id is not None:
                     reclaimed = await self._reconcile_idle_bus_owner_locked(
@@ -1147,9 +1147,21 @@ class TriadMatrixTestProvider(PlayerProvider):
             state.get("attributes") or {}
         ).get("source")
 
-        if current_source not in (
+        current_bus = next(
+            (
+                candidate
+                for candidate in self._buses
+                if candidate.source_name == current_source
+            ),
             None,
-            bus.source_name,
+        )
+
+        # Explicit MA playback/grouping may take over the selected room from a
+        # non-MA matrix source. Still fail closed if the room has unexpectedly
+        # moved onto the other MA bus since reservation.
+        if (
+            current_bus is not None
+            and current_bus is not bus
         ):
             raise PlayerCommandFailed(
                 f"Refusing to reroute "
