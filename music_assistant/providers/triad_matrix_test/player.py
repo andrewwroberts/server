@@ -170,8 +170,14 @@ class TriadMatrixTestPlayer(Player):
             volume,
             int | float,
         ):
-            self._attr_volume_level = round(
-                float(volume) * 100
+            self._attr_volume_level = (
+                self._prov.denon_level_to_theater_volume(
+                    float(volume)
+                )
+                if self._prov.is_theater_player(self)
+                else round(
+                    float(volume) * 100
+                )
             )
 
         muted = control_attrs.get(

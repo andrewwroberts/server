@@ -84,6 +84,14 @@ THEATER_AVR_SOURCE = "CD"
 THEATER_AVR_SOURCE_COMMAND = "/goform/formiPhoneAppDirect.xml?SICD"
 THEATER_FEED_VOLUME = 100
 
+# Home Assistant exposes the Denon volume as a normalized 0.0-0.98 value
+# corresponding to approximately -80 dB through +18 dB. The whole-home
+# music UI should not expose that entire AVR range: it is far too sensitive
+# compared with the ordinary Triad rooms.
+THEATER_VOLUME_ZERO_LEVEL = 0.0
+THEATER_VOLUME_MIN_DB = -65.0
+THEATER_VOLUME_MAX_DB = -10.0
+
 ROOMS: dict[str, RoomDefinition] = {
     "triad_test_master_shower": {
         "name": "Master Shower",
@@ -394,6 +402,87 @@ class TriadMatrixTestProvider(PlayerProvider):
     ) -> bool:
         """Return whether this is the hybrid Triad/Denon Theater zone."""
         return player.player_id == THEATER_PLAYER_ID
+
+    @staticmethod
+    def theater_volume_to_denon_level(
+        volume_level: int,
+    ) -> float:
+        """Map logical Theater 0-100 volume onto the useful Denon music range."""
+        logical = max(
+            0,
+            min(100, volume_level),
+        )
+
+        if logical == 0:
+            return THEATER_VOLUME_ZERO_LEVEL
+
+        # Preserve the useful listening range while roughly halving the
+        # sensitivity of the logical slider:
+        #
+        #   logical  1 -> about -64.45 dB
+        #   logical 33 -> about -46.85 dB
+        #   logical 50 ->       -37.50 dB
+        #   logical100 ->       -10.00 dB
+        #
+        # Home Assistant Denon normalization is dB = level * 100 - 80.
+        db = (
+            THEATER_VOLUME_MIN_DB
+            + (
+                logical
+                * (
+                    THEATER_VOLUME_MAX_DB
+                    - THEATER_VOLUME_MIN_DB
+                )
+                / 100
+            )
+        )
+
+        return (
+            db + 80
+        ) / 100
+
+    @staticmethod
+    def denon_level_to_theater_volume(
+        denon_level: float,
+    ) -> int:
+        """Map the Denon normalized level back to logical Theater 0-100."""
+        level = max(
+            0.0,
+            min(0.98, float(denon_level)),
+        )
+
+        if level <= THEATER_VOLUME_ZERO_LEVEL:
+            return 0
+
+        db = (
+            level * 100
+        ) - 80
+
+        if db <= THEATER_VOLUME_MIN_DB:
+            return 1
+
+        if db >= THEATER_VOLUME_MAX_DB:
+            return 100
+
+        logical = (
+            (
+                db
+                - THEATER_VOLUME_MIN_DB
+            )
+            * 100
+            / (
+                THEATER_VOLUME_MAX_DB
+                - THEATER_VOLUME_MIN_DB
+            )
+        )
+
+        return max(
+            1,
+            min(
+                100,
+                round(logical),
+            ),
+        )
 
     async def get_room_control_state(
         self,
@@ -1244,16 +1333,22 @@ class TriadMatrixTestProvider(PlayerProvider):
         volume_level: int,
     ) -> None:
         """Set user-facing room volume and verify the resulting level."""
-        expected = (
-            max(
-                0,
-                min(100, volume_level),
-            )
-            / 100
-        )
-
         theater = self.is_theater_player(
             player
+        )
+
+        expected = (
+            self.theater_volume_to_denon_level(
+                volume_level
+            )
+            if theater
+            else (
+                max(
+                    0,
+                    min(100, volume_level),
+                )
+                / 100
+            )
         )
 
         entity_id = (

@@ -2089,6 +2089,102 @@ async def test_normal_room_route_does_not_prepare_denon() -> None:
     )
 
 
+def test_theater_volume_mapping_boundaries() -> None:
+    """Logical Theater volume uses a restricted Denon music range."""
+    provider = _provider()
+
+    assert (
+        provider.theater_volume_to_denon_level(0)
+        == 0.0
+    )
+
+    assert provider.theater_volume_to_denon_level(
+        1
+    ) == pytest.approx(
+        0.1555,
+        abs=0.0001,
+    )
+
+    assert provider.theater_volume_to_denon_level(
+        33
+    ) == pytest.approx(
+        0.3315,
+        abs=0.0001,
+    )
+
+    assert provider.theater_volume_to_denon_level(
+        50
+    ) == pytest.approx(
+        0.425,
+        abs=0.0001,
+    )
+
+    assert provider.theater_volume_to_denon_level(
+        100
+    ) == pytest.approx(
+        0.70,
+        abs=0.0001,
+    )
+
+
+def test_theater_inverse_volume_mapping() -> None:
+    """Denon changes map back into the logical Theater slider."""
+    provider = _provider()
+
+    assert (
+        provider.denon_level_to_theater_volume(0.0)
+        == 0
+    )
+
+    assert (
+        provider.denon_level_to_theater_volume(0.15)
+        == 1
+    )
+
+    assert (
+        provider.denon_level_to_theater_volume(0.33)
+        == 33
+    )
+
+    assert (
+        provider.denon_level_to_theater_volume(0.425)
+        == 50
+    )
+
+    assert (
+        provider.denon_level_to_theater_volume(0.70)
+        == 100
+    )
+
+    assert (
+        provider.denon_level_to_theater_volume(0.90)
+        == 100
+    )
+
+
+def test_theater_volume_mapping_round_trip() -> None:
+    """Useful logical values survive a forward/inverse conversion."""
+    provider = _provider()
+
+    for logical in (
+        1,
+        10,
+        25,
+        33,
+        50,
+        75,
+        100,
+    ):
+        denon = provider.theater_volume_to_denon_level(
+            logical
+        )
+        restored = provider.denon_level_to_theater_volume(
+            denon
+        )
+
+        assert restored == logical
+
+
 async def test_theater_volume_and_mute_target_denon() -> None:
     """Theater MA controls operate the receiver, not Output 9."""
     provider = _provider()
@@ -2130,7 +2226,10 @@ async def test_theater_volume_and_mute_target_denon() -> None:
     assert (
         volume_call.kwargs["service_data"]
         == {
-            "volume_level": 0.42,
+            "volume_level": pytest.approx(
+                0.381,
+                abs=0.001,
+            ),
         }
     )
 
@@ -2207,7 +2306,7 @@ async def test_theater_poll_reports_denon_volume_and_mute() -> None:
 
     assert theater._attr_available is True
     assert theater._attr_powered is False
-    assert theater._attr_volume_level == 56
+    assert theater._attr_volume_level == 75
     assert theater._attr_volume_muted is True
 
 
