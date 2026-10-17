@@ -2351,3 +2351,132 @@ async def test_theater_disconnect_does_not_power_off_denon() -> None:
         call.kwargs["entity_id"]
         != THEATER_AVR_ENTITY
     )
+
+
+@pytest.mark.asyncio
+async def test_duplicate_play_while_triad_starting_does_not_replace_flow() -> None:
+    """A second PLAY during IDLE startup must not call queue.resume()."""
+    from inspect import unwrap
+
+    room_id = "triad_test_family_room"
+    logical_player = SimpleNamespace(
+        player_id=room_id,
+        state=SimpleNamespace(
+            name="Family Room Ceiling",
+            playback_state=PlaybackState.IDLE,
+            active_source=room_id,
+        ),
+        transport_start_pending=True,
+    )
+    resume = AsyncMock()
+    controller = PlayerController.__new__(PlayerController)
+    controller._get_player_with_redirect = MagicMock(return_value=logical_player)
+    controller.logger = MagicMock()
+
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def fake_player_lock(*_args, **_kwargs):
+        yield
+
+    controller.get_player_lock = fake_player_lock
+    controller.mass = SimpleNamespace(
+        player_queues=SimpleNamespace(
+            get=MagicMock(return_value=SimpleNamespace(queue_id=room_id)),
+            resume=resume,
+        )
+    )
+
+    await unwrap(PlayerController.cmd_play)(controller, room_id)
+
+    resume.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_idle_triad_with_reserved_bus_reaches_actual_stop() -> None:
+    """A false-IDLE state may not swallow STOP while a physical bus is owned."""
+    room_id = "triad_test_family_room"
+    player = SimpleNamespace(
+        player_id=room_id,
+        state=SimpleNamespace(playback_state=PlaybackState.IDLE),
+        active_output_protocol="native",
+        stop_when_idle=True,
+        mark_stop_called=MagicMock(),
+        stop=AsyncMock(),
+    )
+    controller = PlayerController.__new__(PlayerController)
+    controller.get_player = MagicMock(return_value=player)
+    controller.schedule_active_output_protocol_clear = MagicMock()
+
+    await controller._handle_cmd_stop(room_id)
+
+    player.stop.assert_awaited_once_with()
+    player.mark_stop_called.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_regular_idle_player_stop_remains_idempotent() -> None:
+    """The Triad special case must not start stopping unrelated idle players."""
+    room_id = "unrelated_idle_speaker"
+    player = SimpleNamespace(
+        player_id=room_id,
+        state=SimpleNamespace(playback_state=PlaybackState.IDLE),
+        active_output_protocol="native",
+        stop=AsyncMock(),
+    )
+    controller = PlayerController.__new__(PlayerController)
+    controller.get_player = MagicMock(return_value=player)
+
+    await controller._handle_cmd_stop(room_id)
+
+    player.stop.assert_not_awaited()
+
+
+def test_pending_triad_start_is_bounded_and_requires_bus() -> None:
+    """Repeat PLAY protects one stream, without permanently blocking retry."""
+    from time import time
+
+    provider = _provider()
+    room_id = "triad_test_family_room"
+    player = TriadMatrixTestPlayer.__new__(TriadMatrixTestPlayer)
+    player._provider = provider
+    player._player_id = room_id
+    bus = provider._buses[0]
+    player._transport_started_at = time() - 3
+
+    assert not player.transport_start_pending
+    bus.owner_id = room_id
+    assert player.transport_start_pending
+    player._transport_started_at = time() - 25
+    assert not player.transport_start_pending
+    player._transport_started_at = None
+    assert not player.transport_start_pending
+
+
+@pytest.mark.asyncio
+async def test_triad_stop_sends_sonos_command_even_if_backend_reports_idle() -> None:
+    """An idle state cannot hide an actual streaming Sonos renderer."""
+    provider = _provider()
+    bus = provider._buses[0]
+    backend = provider.get_backend_player(bus)
+    assert backend is not None
+    backend.stop = AsyncMock()
+    provider.wait_for_backend_idle = AsyncMock()
+
+    class FakeLock:
+        async def __aenter__(self):
+            return None
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    provider.mass.players.get_player_lock = lambda *_args, **_kwargs: FakeLock()
+    player = TriadMatrixTestPlayer.__new__(TriadMatrixTestPlayer)
+    player._provider = provider
+    player.mass = provider.mass
+
+    errors = await player._cleanup_session(bus, [])
+
+    assert errors == []
+    backend.stop.assert_awaited_once_with()
+    provider.wait_for_backend_idle.assert_awaited_once_with(bus, backend)

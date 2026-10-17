@@ -667,6 +667,19 @@ class PlayerController(AnnouncementsMixin, AudioSourceMixin, ProtocolLinkingMixi
                     player.state.name,
                 )
                 return
+            # Triad deliberately reports IDLE until its Sonos renderer confirms
+            # actual playback. Another PLAY during that window is not a new
+            # request to replace the already-buffering flow: leave its queue,
+            # current item and resume position untouched.
+            if (
+                player.state.playback_state == PlaybackState.IDLE
+                and getattr(player, "transport_start_pending", False)
+            ):
+                self.logger.info(
+                    "Ignoring duplicate PLAY while %s is starting playback",
+                    player.state.name,
+                )
+                return
             # player is not paused: check for queue redirect, then delegate to internal handler
             if player.state.playback_state != PlaybackState.PAUSED:
                 source = player.state.active_source
@@ -4724,7 +4737,13 @@ class PlayerController(AnnouncementsMixin, AudioSourceMixin, ProtocolLinkingMixi
                 await protocol_player.stop()
                 if len(protocol_player.group_members) <= 1:
                     self.schedule_active_output_protocol_clear(player)
-            return
+                return
+            # Some native players (the Triad matrix in particular) remain
+            # physically connected during a pending stream start, even though
+            # their logical state is IDLE. The provider must get the STOP so
+            # it can stop Sonos and disconnect its physical route.
+            if not getattr(player, "stop_when_idle", False):
+                return
         player.mark_stop_called()
         # Delegate to active protocol player if one is active
         target_player = player

@@ -73,6 +73,30 @@ class TriadMatrixTestPlayer(Player):
         return False
 
     @property
+    def stop_when_idle(self) -> bool:
+        """The matrix can still own a live transport while MA reports IDLE.
+
+        A queue-start confirmation timeout must never make the user's STOP
+        command a no-op. An unowned, genuinely idle room stays unchanged.
+        """
+        return self._prov.get_bus_for_owner(self.player_id) is not None
+
+    @property
+    def transport_start_pending(self) -> bool:
+        """Suppress repeat PLAY while a new Sonos flow is still starting.
+
+        The guard is bounded so a stalled start can be retried by the user.
+        A new play_media, successful confirmation, pause, and stop all own
+        their corresponding transport marker lifecycle.
+        """
+        started_at = self._transport_started_at
+        return (
+            started_at is not None
+            and self._prov.get_bus_for_owner(self.player_id) is not None
+            and 0 <= time() - started_at < 20
+        )
+
+    @property
     def needs_poll(self) -> bool:
         """Poll Home Assistant for Triad room state."""
         return True
@@ -772,9 +796,10 @@ class TriadMatrixTestPlayer(Player):
                     backend.player_id,
                     PlayerLockPurpose.PLAYBACK,
                 ):
-                    await self.mass.players._handle_cmd_stop(
-                        backend.player_id,
-                    )
+                    # Bypass MA's logical-IDLE short circuit. A Sonos flow may
+                    # already be serving audio while the backend has not yet
+                    # published PLAYING; STOP must reach the physical renderer.
+                    await backend.stop()
                 await self._prov.wait_for_backend_idle(bus, backend)
             except Exception as err:
                 errors.append(f"stop {bus.source_name}: {err}")
