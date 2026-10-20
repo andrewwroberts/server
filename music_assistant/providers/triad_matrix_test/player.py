@@ -19,6 +19,9 @@ if TYPE_CHECKING:
 class TriadMatrixTestPlayer(Player):
     """One logical Music Assistant room backed by a Triad output."""
 
+    _backend_playing_seen_at: float | None = None
+    _pending_release: tuple[TriadMatrixTestPlayer, ...] = ()
+
     def __init__(
         self,
         provider: TriadMatrixTestProvider,
@@ -61,6 +64,13 @@ class TriadMatrixTestPlayer(Player):
         # in that position, so logical Triad stream-time subtracts this fixed
         # per-transport origin rather than exposing the startup lead.
         self._transport_elapsed_origin: float | None = None
+        # When the hidden Sonos backend was first seen PLAYING for the current transport. Sonos only
+        # pushes position updates on state changes, so a playing flow stream can keep reporting the
+        # 0.0 position of its PLAYING event for the whole song.
+        self._backend_playing_seen_at: float | None = None
+        # Rooms whose Triad output could not be switched off during stop() (Home Assistant briefly
+        # unreachable); released as soon as Home Assistant answers again.
+        self._pending_release: tuple[TriadMatrixTestPlayer, ...] = ()
 
     @property
     def requires_flow_mode(self) -> bool:
@@ -74,7 +84,8 @@ class TriadMatrixTestPlayer(Player):
 
     @property
     def stop_when_idle(self) -> bool:
-        """The matrix can still own a live transport while MA reports IDLE.
+        """
+        The matrix can still own a live transport while MA reports IDLE.
 
         A queue-start confirmation timeout must never make the user's STOP
         command a no-op. An unowned, genuinely idle room stays unchanged.
@@ -83,7 +94,8 @@ class TriadMatrixTestPlayer(Player):
 
     @property
     def transport_start_pending(self) -> bool:
-        """Suppress repeat PLAY while a new Sonos flow is still starting.
+        """
+        Suppress repeat PLAY while a new Sonos flow is still starting.
 
         The guard is bounded so a stalled start can be retried by the user.
         A new play_media, successful confirmation, pause, and stop all own
@@ -110,6 +122,7 @@ class TriadMatrixTestPlayer(Player):
 
     async def poll(self) -> None:
         """Refresh Triad state and mirror the reserved Sonos backend."""
+        hass_reachable = True
         try:
             state = await self._prov.get_zone_state(self.zone_entity)
         except Exception as err:
@@ -118,9 +131,23 @@ class TriadMatrixTestPlayer(Player):
                 self.display_name,
                 err,
             )
-            self._attr_available = False
-            self.update_state()
-            return
+            owned_bus = self._prov.get_bus_for_owner(self.player_id)
+            if (
+                owned_bus is None
+                or self._prov.get_backend_player(owned_bus, required=False) is None
+                or not self._attr_available
+            ):
+                self._attr_available = False
+                self.update_state()
+                return
+            # This room is carrying a live stream on an available Sonos backend. Keep it available
+            # (so Pause/Stop are accepted) and keep mirroring the backend; only the Triad zone's own
+            # state is unknown until Home Assistant answers again.
+            hass_reachable = False
+            state = {"state": "on" if self._attr_powered else "off", "attributes": {}}
+
+        if hass_reachable and self._pending_release:
+            await self._finish_pending_release()
 
         raw_state = state.get("state")
         bus = self._prov.get_bus_for_owner(self.player_id)
@@ -135,7 +162,7 @@ class TriadMatrixTestPlayer(Player):
 
         control_state = state
 
-        if self._prov.is_theater_player(self):
+        if self._prov.is_theater_player(self) and hass_reachable:
             try:
                 control_state = (
                     await self._prov.get_room_control_state(
@@ -318,13 +345,26 @@ class TriadMatrixTestPlayer(Player):
                 None,
             )
 
-            transport_confirmed = (
+            fresh_backend_playing = (
                 transport_started_at is not None
                 and backend_playback_state == PlaybackState.PLAYING
-                and isinstance(backend_elapsed, int | float)
-                and backend_elapsed > 0
                 and isinstance(backend_elapsed_updated, int | float)
                 and backend_elapsed_updated >= transport_started_at
+            )
+            if fresh_backend_playing:
+                if self._backend_playing_seen_at is None:
+                    self._backend_playing_seen_at = time()
+            elif transport_started_at is not None:
+                self._backend_playing_seen_at = None
+
+            transport_confirmed = fresh_backend_playing and (
+                (isinstance(backend_elapsed, int | float) and backend_elapsed > 0)
+                # Sonos reports PLAYING (position 0.0) once and then stays silent while the flow
+                # plays; a PLAYING report that has held for 1.5 s is a started transport.
+                or (
+                    self._backend_playing_seen_at is not None
+                    and time() - self._backend_playing_seen_at >= 1.5
+                )
             )
 
             finished_transport = (
@@ -372,9 +412,12 @@ class TriadMatrixTestPlayer(Player):
                 # fetch/buffer startup interval. Treat that raw position as this
                 # transport's zero. From here onward we subtract only this fixed
                 # renderer-space origin; no wall-clock estimate is involved.
-                transport_elapsed_origin = float(backend_elapsed)
+                transport_elapsed_origin = float(
+                    backend_elapsed if isinstance(backend_elapsed, int | float) else 0.0
+                )
                 self._transport_elapsed_origin = transport_elapsed_origin
                 self._transport_started_at = None
+                self._backend_playing_seen_at = None
 
                 self._attr_playback_state = backend_playback_state
                 self._attr_elapsed_time = 0.0
@@ -470,6 +513,8 @@ class TriadMatrixTestPlayer(Player):
     async def play_media(self, media: PlayerMedia) -> None:
         """Start MA playback on an available source bus."""
         self._intentional_pause = False
+        self._pending_release = ()
+        self._backend_playing_seen_at = None
         backend_media = await self._media_for_backend(media)
         members = self._effective_members()
         bus, backend = await self._prov.claim_bus(
@@ -664,11 +709,24 @@ class TriadMatrixTestPlayer(Player):
         )
 
         errors = await self._cleanup_session(bus, members)
-        if errors:
+        backend_errors = [e for e in errors if not e.startswith("disconnect ")]
+        if backend_errors:
             raise PlayerCommandFailed(
                 f"Could not safely release {bus.source_name}; it remains reserved. "
                 f"{'; '.join(errors)}"
             )
+        if errors:
+            # The Sonos renderer is stopped (the audio has ended); only switching the Triad outputs
+            # off failed, typically because Home Assistant is restarting. Keep the bus reserved so no
+            # other room can be routed into these outputs, and finish the release from poll().
+            self._prov.logger.warning(
+                "TRIAD STOP: %s stopped; output release deferred: %s",
+                self.display_name,
+                "; ".join(errors),
+            )
+            self._pending_release = tuple(members)
+            self._set_idle()
+            return
 
         await self._prov.release_bus(self.player_id)
         self._set_idle()
@@ -840,6 +898,25 @@ class TriadMatrixTestPlayer(Player):
                 "; ".join(rollback_errors),
             )
 
+    async def _finish_pending_release(self) -> None:
+        """Switch off outputs left on by a stop() that ran while Home Assistant was unreachable."""
+        bus = self._prov.get_bus_for_owner(self.player_id)
+        if bus is None or self._attr_playback_state != PlaybackState.IDLE:
+            # A new session took over this room or bus; it owns the routing now.
+            self._pending_release = ()
+            return
+        remaining: list[TriadMatrixTestPlayer] = []
+        for member in self._pending_release:
+            try:
+                await self._prov.turn_off_zone(member)
+            except Exception as err:
+                self._prov.logger.debug("Deferred release of %s still pending: %s", member.display_name, err)
+                remaining.append(member)
+        self._pending_release = tuple(remaining)
+        if not remaining:
+            await self._prov.release_bus(self.player_id)
+            self._prov.logger.info("TRIAD STOP: deferred release of %s completed", bus.source_name)
+
     def _set_idle(self) -> None:
         """Reset local playback state after a successful stop."""
         self._intentional_pause = False
@@ -850,6 +927,7 @@ class TriadMatrixTestPlayer(Player):
         self._attr_elapsed_time_last_updated = None
         self._transport_started_at = None
         self._transport_elapsed_origin = None
+        self._backend_playing_seen_at = None
         self.update_state()
 
     @property

@@ -9,8 +9,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from music_assistant_models.enums import MediaType, PlaybackState
-from music_assistant_models.player import PlayerMedia
 from music_assistant_models.errors import PlayerCommandFailed
+from music_assistant_models.player import PlayerMedia
 
 from music_assistant.controllers.player_queues.controller import PlayerQueuesController
 from music_assistant.controllers.players.controller import PlayerController
@@ -2480,3 +2480,136 @@ async def test_triad_stop_sends_sonos_command_even_if_backend_reports_idle() -> 
     assert errors == []
     backend.stop.assert_awaited_once_with()
     provider.wait_for_backend_idle.assert_awaited_once_with(bus, backend)
+
+
+def _queue_player(
+    provider: TriadMatrixTestProvider,
+) -> tuple[TriadMatrixTestPlayer, Any]:
+    """Build the first room as the owner of bus 1 with an idle MA queue."""
+    player_id = next(iter(ROOMS))
+    room = ROOMS[player_id]
+    bus = provider._buses[0]
+    bus.owner_id = player_id
+    backend = provider.mass.players.get_player(bus.backend_player_id)
+    assert backend is not None
+
+    provider.mass.player_queues = SimpleNamespace(
+        get=lambda _queue_id: None,
+        queue_data_or_none=lambda _queue_id: None,
+        flow_queue_exhausted=lambda _queue_id, _session_id: False,
+    )
+    provider.get_zone_state = AsyncMock(  # type: ignore[method-assign]
+        return_value={"entity_id": room["entity_id"], "state": "on", "attributes": {}}
+    )
+
+    player = TriadMatrixTestPlayer.__new__(TriadMatrixTestPlayer)
+    player._provider = provider
+    player.mass = provider.mass
+    player._player_id = player_id
+    player.zone_entity = str(room["entity_id"])
+    player._intentional_pause = False
+    player._attr_current_media = None
+    player._attr_available = True
+    player._attr_powered = True
+    player._attr_playback_state = PlaybackState.IDLE
+    player._transport_elapsed_origin = None
+    cast("Any", player)._cache = {"display_name": str(room["name"])}
+    cast("Any", player).update_state = MagicMock()
+    return player, backend
+
+
+@pytest.mark.asyncio
+async def test_poll_confirms_transport_when_sonos_never_reports_progress() -> None:
+    """A flow that Sonos reports PLAYING at 0.0 and never updates must still become PLAYING."""
+    from time import time
+
+    provider = _provider((PlaybackState.PLAYING, PlaybackState.IDLE))
+    player, backend = _queue_player(provider)
+    started = time() - 5
+    player._transport_started_at = started
+    backend.state.elapsed_time = 0.0
+    backend.state.elapsed_time_last_updated = started + 0.5
+
+    await player.poll()
+    assert player._attr_playback_state == PlaybackState.IDLE
+
+    # The same PLAYING report is still the latest one 1.5 s later.
+    player._backend_playing_seen_at = time() - 2
+    await player.poll()
+    assert player._attr_playback_state == PlaybackState.PLAYING
+    assert player._transport_started_at is None
+    assert player._transport_elapsed_origin == 0.0
+
+    # Afterwards the renderer clock is anchored on the PLAYING report, so MA/HA extrapolate progress.
+    await player.poll()
+    assert player._attr_playback_state == PlaybackState.PLAYING
+    assert player._attr_elapsed_time == 0.0
+    assert player._attr_elapsed_time_last_updated == started + 0.5
+
+
+@pytest.mark.asyncio
+async def test_poll_keeps_streaming_room_available_while_home_assistant_is_unreachable() -> None:
+    """A Home Assistant restart must not strand a playing room without Pause/Stop."""
+    provider = _provider((PlaybackState.PLAYING, PlaybackState.IDLE))
+    player, backend = _queue_player(provider)
+    player._transport_started_at = None
+    player._transport_elapsed_origin = 0.0
+    backend.state.elapsed_time = 0.0
+    backend.state.elapsed_time_last_updated = 500.0
+    provider.get_zone_state = AsyncMock(  # type: ignore[method-assign]
+        side_effect=RuntimeError("Home Assistant is not connected")
+    )
+
+    await player.poll()
+
+    assert player._attr_available is True
+    assert player._attr_playback_state == PlaybackState.PLAYING
+
+    # A room that is not carrying a stream still goes unavailable.
+    provider._buses[0].owner_id = None
+    await player.poll()
+    assert player._attr_available is False
+
+
+@pytest.mark.asyncio
+async def test_stop_while_home_assistant_is_unreachable_defers_output_release() -> None:
+    """Stop ends the audio at once and switches the Triad output off when HA returns."""
+    provider = _provider((PlaybackState.PLAYING, PlaybackState.IDLE))
+    player, backend = _queue_player(provider)
+    bus = provider._buses[0]
+    backend.stop = AsyncMock()
+    backend.state.elapsed_time = None
+    backend.state.elapsed_time_last_updated = None
+    provider.wait_for_backend_idle = AsyncMock()  # type: ignore[method-assign]
+
+    class FakeLock:
+        async def __aenter__(self) -> None:
+            return None
+
+        async def __aexit__(self, *_args: object) -> bool:
+            return False
+
+    provider.mass.players.get_player_lock = lambda *_args, **_kwargs: FakeLock()
+    cast("Any", player)._effective_members = lambda: [player]
+    provider.turn_off_zone = AsyncMock(  # type: ignore[method-assign]
+        side_effect=RuntimeError("Home Assistant is not connected")
+    )
+    provider.release_bus = AsyncMock()  # type: ignore[method-assign]
+    player._attr_playback_state = PlaybackState.PLAYING
+
+    await player.stop()
+
+    backend.stop.assert_awaited_once_with()
+    assert player._attr_playback_state == PlaybackState.IDLE
+    assert bus.owner_id == player.player_id
+    provider.release_bus.assert_not_awaited()
+    assert player._pending_release == (player,)
+
+    # Home Assistant is back: the next poll switches the output off and frees the bus.
+    provider.turn_off_zone = AsyncMock()  # type: ignore[method-assign]
+    backend.state.playback_state = PlaybackState.IDLE
+    await player.poll()
+
+    provider.turn_off_zone.assert_awaited_once_with(player)
+    provider.release_bus.assert_awaited_once_with(player.player_id)
+    assert player._pending_release == ()

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from time import monotonic
 from typing import TYPE_CHECKING, Any, TypedDict
 
+import aiohttp
 from music_assistant_models.enums import PlaybackState, PlayerFeature
 from music_assistant_models.errors import PlayerCommandFailed
 
@@ -298,18 +300,80 @@ class TriadMatrixTestProvider(PlayerProvider):
         service_data: dict[str, Any] | None = None,
     ) -> None:
         """Call a Home Assistant media_player service."""
-        hass_provider = self.get_hass_provider()
+        await self._call_hass_service("media_player", service, entity_id, service_data)
 
-        kwargs: dict[str, Any] = {
-            "domain": "media_player",
-            "service": service,
-            "target": {"entity_id": entity_id},
-        }
+    async def _call_hass_service(
+        self,
+        domain: str,
+        service: str,
+        entity_id: str,
+        service_data: dict[str, Any] | None = None,
+    ) -> None:
+        """
+        Call a Home Assistant service.
 
-        if service_data is not None:
-            kwargs["service_data"] = service_data
+        Uses MA's Home Assistant provider when it is connected and Home Assistant's REST API otherwise.
 
-        await hass_provider.hass.call_service(**kwargs)
+        :param domain: Service domain.
+        :param service: Service name.
+        :param entity_id: Target entity.
+        :param service_data: Optional service data.
+        """
+        hass_provider = self.get_hass_provider(required=False)
+        if hass_provider is not None:
+            kwargs: dict[str, Any] = {
+                "domain": domain,
+                "service": service,
+                "target": {"entity_id": entity_id},
+            }
+            if service_data is not None:
+                kwargs["service_data"] = service_data
+            try:
+                await hass_provider.hass.call_service(**kwargs)
+                return
+            except Exception as err:
+                if not os.environ.get("SUPERVISOR_TOKEN"):
+                    raise
+                self.logger.debug("HA provider call %s.%s failed (%s); using REST", domain, service, err)
+        # MA reconnects its Home Assistant provider on a fixed back-off (about two minutes after a
+        # Home Assistant restart). Rooms must stay controllable as soon as Home Assistant answers.
+        await self._direct_hass_request(
+            "POST",
+            f"/services/{domain}/{service}",
+            {"entity_id": entity_id, **(service_data or {})},
+        )
+
+    async def _direct_hass_request(
+        self,
+        method: str,
+        path: str,
+        body: dict[str, Any] | None = None,
+    ) -> Any:
+        """
+        Call Home Assistant's REST API through the Supervisor.
+
+        :param method: HTTP method.
+        :param path: Path below /api.
+        :param body: Optional JSON body.
+        """
+        token = os.environ.get("SUPERVISOR_TOKEN")
+        if not token:
+            raise PlayerCommandFailed(
+                "Triad prototype requires the Music Assistant "
+                "Home Assistant provider, but it is not available."
+            )
+        async with self.mass.http_session.request(
+            method,
+            f"http://supervisor/core/api{path}",
+            json=body,
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=aiohttp.ClientTimeout(total=8),
+        ) as resp:
+            if resp.status >= 400:
+                raise PlayerCommandFailed(
+                    f"Home Assistant returned HTTP {resp.status} for {method} {path}."
+                )
+            return await resp.json(content_type=None)
 
     async def _verified_hass_command(
         self,
@@ -323,26 +387,12 @@ class TriadMatrixTestProvider(PlayerProvider):
         attempts: int = 5,
     ) -> dict[str, Any]:
         """Run and verify a HA service outside the media_player domain."""
-        hass_provider = self.get_hass_provider()
         last_state: dict[str, Any] | None = None
         last_error: Exception | None = None
 
         for attempt in range(1, attempts + 1):
             try:
-                kwargs: dict[str, Any] = {
-                    "domain": domain,
-                    "service": service,
-                    "target": {
-                        "entity_id": entity_id,
-                    },
-                }
-
-                if service_data is not None:
-                    kwargs["service_data"] = service_data
-
-                await hass_provider.hass.call_service(
-                    **kwargs
-                )
+                await self._call_hass_service(domain, service, entity_id, service_data)
 
                 await asyncio.sleep(0.35)
 
@@ -1431,9 +1481,23 @@ class TriadMatrixTestProvider(PlayerProvider):
         entity_ids: list[str],
     ) -> dict[str, dict[str, Any]]:
         """Return Home Assistant states keyed by entity ID."""
-        hass_provider = self.get_hass_provider()
-        states = await hass_provider.get_states(entity_ids=entity_ids)
-        return {str(state["entity_id"]): state for state in states if state.get("entity_id")}
+        hass_provider = self.get_hass_provider(required=False)
+        if hass_provider is not None:
+            try:
+                states = await hass_provider.get_states(entity_ids=entity_ids)
+                return {
+                    str(state["entity_id"]): state for state in states if state.get("entity_id")
+                }
+            except Exception as err:
+                if not os.environ.get("SUPERVISOR_TOKEN"):
+                    raise
+                self.logger.debug("HA provider state read failed (%s); using REST", err)
+        result: dict[str, dict[str, Any]] = {}
+        for entity_id in entity_ids:
+            state = await self._direct_hass_request("GET", f"/states/{entity_id}")
+            if isinstance(state, dict) and state.get("entity_id"):
+                result[str(state["entity_id"])] = state
+        return result
 
     @staticmethod
     def _volume_matches(state: dict[str, Any], expected: float) -> bool:
