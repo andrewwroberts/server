@@ -1476,35 +1476,38 @@ async def test_poll_tracks_logical_queue_now_playing_metadata() -> None:
     # A newly started transport must reject an elapsed anchor that predates
     # that transport. It must also remain logically non-playing so neither MA
     # nor HA can extrapolate an elapsed timer during renderer startup.
+    from time import time
+
+    t0 = time()
     player._attr_playback_state = PlaybackState.IDLE
-    player._transport_started_at = 1000.0
+    player._transport_started_at = t0
     player._transport_elapsed_origin = None
     backend.state.elapsed_time = 9999.0
-    backend.state.elapsed_time_last_updated = 999.0
+    backend.state.elapsed_time_last_updated = t0 - 1
 
     await player.poll()
 
     assert player._attr_playback_state == PlaybackState.IDLE
     assert player._attr_elapsed_time == 0.0
-    assert player._transport_started_at == 1000.0
+    assert player._transport_started_at == t0
 
     # Even a fresh timestamp is not sufficient while the renderer position is
     # still zero: Sonos can report PLAYING before audible playback begins.
     backend.state.elapsed_time = 0.0
-    backend.state.elapsed_time_last_updated = 1001.0
+    backend.state.elapsed_time_last_updated = t0 + 1
 
     await player.poll()
 
     assert player._attr_playback_state == PlaybackState.IDLE
     assert player._attr_elapsed_time == 0.0
-    assert player._transport_started_at == 1000.0
+    assert player._transport_started_at == t0
 
     # Sonos may already report several seconds of renderer time when audible
     # playback finally starts. That first positive value becomes transport zero
     # instead of being exposed as an immediate elapsed-time jump.
     old_queue_anchor = queue.elapsed_time_last_updated
     backend.state.elapsed_time = 8.25
-    backend.state.elapsed_time_last_updated = 1002.0
+    backend.state.elapsed_time_last_updated = t0 + 2
 
     await player.poll()
 
@@ -1517,13 +1520,13 @@ async def test_poll_tracks_logical_queue_now_playing_metadata() -> None:
     # Subsequent renderer progress is measured relative to the fixed transport
     # origin, so only genuinely post-start playback time is exposed.
     backend.state.elapsed_time = 10.25
-    backend.state.elapsed_time_last_updated = 1004.0
+    backend.state.elapsed_time_last_updated = t0 + 4
 
     await player.poll()
 
     assert player._attr_playback_state == PlaybackState.PLAYING
     assert player._attr_elapsed_time == 2.0
-    assert player._attr_elapsed_time_last_updated == 1004.0
+    assert player._attr_elapsed_time_last_updated == t0 + 4
 
 
 
@@ -2525,7 +2528,7 @@ async def test_poll_confirms_transport_when_sonos_never_reports_progress() -> No
 
     provider = _provider((PlaybackState.PLAYING, PlaybackState.IDLE))
     player, backend = _queue_player(provider)
-    started = time() - 5
+    started = time() - 1
     player._transport_started_at = started
     backend.state.elapsed_time = 0.0
     backend.state.elapsed_time_last_updated = started + 0.5
@@ -2613,3 +2616,38 @@ async def test_stop_while_home_assistant_is_unreachable_defers_output_release() 
     provider.turn_off_zone.assert_awaited_once_with(player)
     provider.release_bus.assert_awaited_once_with(player.player_id)
     assert player._pending_release == ()
+
+
+@pytest.mark.asyncio
+async def test_poll_confirms_restart_on_renderer_that_was_already_playing() -> None:
+    """A new flow on a Sonos that never left PLAYING (old timestamp) must still become PLAYING."""
+    from time import time
+
+    provider = _provider((PlaybackState.PLAYING, PlaybackState.IDLE))
+    player, backend = _queue_player(provider)
+    player._attr_playback_state = PlaybackState.PAUSED
+    backend.state.elapsed_time = 0.0
+    backend.state.elapsed_time_last_updated = time() - 600
+
+    player._transport_started_at = time() - 1
+    await player.poll()
+    assert player._attr_playback_state == PlaybackState.PAUSED
+
+    player._transport_started_at = time() - 3
+    await player.poll()
+    assert player._attr_playback_state == PlaybackState.PLAYING
+    assert player._transport_started_at is None
+
+
+@pytest.mark.asyncio
+async def test_poll_does_not_confirm_restart_while_renderer_is_not_playing() -> None:
+    """The time fallback never turns a stopped renderer into a playing room."""
+    from time import time
+
+    provider = _provider((PlaybackState.IDLE, PlaybackState.IDLE))
+    player, backend = _queue_player(provider)
+    backend.state.elapsed_time = 0.0
+    backend.state.elapsed_time_last_updated = time() - 600
+    player._transport_started_at = time() - 5
+    await player.poll()
+    assert player._attr_playback_state == PlaybackState.IDLE

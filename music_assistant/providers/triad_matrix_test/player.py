@@ -15,6 +15,10 @@ from music_assistant.models.player import Player, PlayerMedia
 if TYPE_CHECKING:
     from .provider import MatrixBus, TriadMatrixTestProvider
 
+# Seconds after a new flow was handed to a Sonos renderer that is still PLAYING, after which that
+# PLAYING report counts as the new transport.
+BACKEND_RESTART_CONFIRM_S = 2.5
+
 
 class TriadMatrixTestPlayer(Player):
     """One logical Music Assistant room backed by a Triad output."""
@@ -348,14 +352,32 @@ class TriadMatrixTestPlayer(Player):
             fresh_backend_playing = (
                 transport_started_at is not None
                 and backend_playback_state == PlaybackState.PLAYING
-                and isinstance(backend_elapsed_updated, int | float)
-                and backend_elapsed_updated >= transport_started_at
+                and (
+                    (
+                        isinstance(backend_elapsed_updated, int | float)
+                        and backend_elapsed_updated >= transport_started_at
+                    )
+                    # A Sonos renderer that was already PLAYING the previous flow sends no new
+                    # PLAYING event for the replacement URI, so its report keeps the old timestamp.
+                    or time() - transport_started_at >= BACKEND_RESTART_CONFIRM_S
+                )
             )
             if fresh_backend_playing:
                 if self._backend_playing_seen_at is None:
                     self._backend_playing_seen_at = time()
             elif transport_started_at is not None:
                 self._backend_playing_seen_at = None
+
+            if transport_started_at is not None and not fresh_backend_playing:
+                self._prov.logger.debug(
+                    "Triad start pending for %s: backend %s state=%s elapsed=%s updated=%s started=%s",
+                    self.player_id,
+                    backend.player_id,
+                    backend_playback_state,
+                    backend_elapsed,
+                    backend_elapsed_updated,
+                    transport_started_at,
+                )
 
             transport_confirmed = fresh_backend_playing and (
                 (isinstance(backend_elapsed, int | float) and backend_elapsed > 0)
@@ -365,6 +387,7 @@ class TriadMatrixTestPlayer(Player):
                     self._backend_playing_seen_at is not None
                     and time() - self._backend_playing_seen_at >= 1.5
                 )
+                or time() - transport_started_at >= BACKEND_RESTART_CONFIRM_S
             )
 
             finished_transport = (
@@ -429,6 +452,14 @@ class TriadMatrixTestPlayer(Player):
             else:
                 self._attr_playback_state = backend_playback_state
 
+                if (
+                    transport_elapsed_origin is not None
+                    and isinstance(backend_elapsed, int | float)
+                    and backend_elapsed < transport_elapsed_origin
+                ):
+                    # The origin was the previous flow's last position (renderer restarted while
+                    # PLAYING); the renderer is now counting the new flow from zero.
+                    transport_elapsed_origin = self._transport_elapsed_origin = 0.0
                 if (
                     transport_elapsed_origin is not None
                     and isinstance(backend_elapsed, int | float)
