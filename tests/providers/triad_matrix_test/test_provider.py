@@ -2651,3 +2651,24 @@ async def test_poll_does_not_confirm_restart_while_renderer_is_not_playing() -> 
     player._transport_started_at = time() - 5
     await player.poll()
     assert player._attr_playback_state == PlaybackState.IDLE
+
+
+@pytest.mark.asyncio
+async def test_poll_that_never_finishes_is_cut_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A hung room check must end (and be logged) instead of holding up the shared poll loop."""
+    from music_assistant.providers.triad_matrix_test import player as player_mod
+
+    provider = _provider((PlaybackState.IDLE, PlaybackState.IDLE))
+    player, _backend = _queue_player(provider)
+    cast("Any", player)._cache["display_name"] = "Master Bedroom"
+    monkeypatch.setattr(player_mod, "POLL_TIMEOUT_S", 0.05)
+    hang = asyncio.Event()
+
+    async def _never() -> None:
+        await hang.wait()
+
+    monkeypatch.setattr(player, "_poll_once", _never)
+    provider.logger = MagicMock()
+    await asyncio.wait_for(player.poll(), timeout=2)
+    assert player._poll_started is None
+    assert "TRIAD POLL TIMEOUT" in provider.logger.warning.call_args[0][0]

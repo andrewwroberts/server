@@ -19,6 +19,8 @@ if TYPE_CHECKING:
 # Seconds after a new flow was handed to a Sonos renderer that is still PLAYING, after which that
 # PLAYING report counts as the new transport.
 BACKEND_RESTART_CONFIRM_S = 2.5
+# Longest a single room check may run (the watchdog reports a check that runs past 10 s first).
+POLL_TIMEOUT_S = 15
 
 
 class TriadMatrixTestPlayer(Player):
@@ -133,7 +135,16 @@ class TriadMatrixTestPlayer(Player):
         self._poll_task = asyncio.current_task()
         self._poll_started = monotonic()
         try:
-            await self._poll_once()
+            # A check that never finishes would hold up Music Assistant's shared player poll loop and
+            # leave every room frozen in its last state; cut it off and let the next check retry.
+            async with asyncio.timeout(POLL_TIMEOUT_S):
+                await self._poll_once()
+        except TimeoutError:
+            self._prov.logger.warning(
+                "TRIAD POLL TIMEOUT: %s check cut off after %ss; the next check retries",
+                self.display_name,
+                POLL_TIMEOUT_S,
+            )
         finally:
             self._poll_started = None
             self._prov._last_poll_done = monotonic()
