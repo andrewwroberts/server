@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from time import time
-from typing import TYPE_CHECKING, cast
+import asyncio
+from time import monotonic, time
+from typing import TYPE_CHECKING, Any, cast
 
 from music_assistant_models.enums import MediaType, PlaybackState, PlayerFeature
 from music_assistant_models.errors import PlayerCommandFailed
@@ -24,6 +25,8 @@ class TriadMatrixTestPlayer(Player):
     """One logical Music Assistant room backed by a Triad output."""
 
     _backend_playing_seen_at: float | None = None
+    _poll_task: asyncio.Task[Any] | None = None
+    _poll_started: float | None = None
     _pending_release: tuple[TriadMatrixTestPlayer, ...] = ()
 
     def __init__(
@@ -126,6 +129,17 @@ class TriadMatrixTestPlayer(Player):
 
     async def poll(self) -> None:
         """Refresh Triad state and mirror the reserved Sonos backend."""
+        # The provider's poll watchdog reads these to report a check that never finishes.
+        self._poll_task = asyncio.current_task()
+        self._poll_started = monotonic()
+        try:
+            await self._poll_once()
+        finally:
+            self._poll_started = None
+            self._prov._last_poll_done = monotonic()
+
+    async def _poll_once(self) -> None:
+        """Refresh Triad state once."""
         hass_reachable = True
         try:
             state = await self._prov.get_zone_state(self.zone_entity)

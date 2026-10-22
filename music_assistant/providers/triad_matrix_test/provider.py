@@ -172,6 +172,8 @@ class TriadMatrixTestProvider(PlayerProvider):
         self._players_by_id: dict[str, TriadMatrixTestPlayer] = {}
         self._buses = [MatrixBus(definition) for definition in BUS_DEFINITIONS]
         self._bus_lock = asyncio.Lock()
+        self._last_poll_done = monotonic()
+        self._watchdog: asyncio.Task[None] | None = None
 
     async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
         """Return provider configuration entries."""
@@ -187,9 +189,14 @@ class TriadMatrixTestProvider(PlayerProvider):
     async def loaded_in_mass(self) -> None:
         """Register the logical Triad room players."""
         await self.discover_players()
+        self._last_poll_done = monotonic()
+        self._watchdog = asyncio.create_task(self._poll_watchdog())
 
     async def unload(self, is_removed: bool = False) -> None:
         """Unload the provider."""
+        if self._watchdog is not None:
+            self._watchdog.cancel()
+            self._watchdog = None
         for player in list(self._players_by_id.values()):
             await self.mass.players.unregister(player.player_id)
         self._players_by_id.clear()
@@ -1567,3 +1574,59 @@ class TriadMatrixTestProvider(PlayerProvider):
             f"Triad command could not be verified after {attempts} attempts: "
             f"{description}; {detail}"
         )
+
+    async def _poll_watchdog(self) -> None:
+        """Log (without changing anything) when room checks hang or stop, with where they are stuck."""
+        stuck_reported: set[int] = set()
+        stopped_reported_at: float | None = None
+        while True:
+            await asyncio.sleep(5)
+            now = monotonic()
+            for player in list(self._players_by_id.values()):
+                started = player._poll_started
+                task = player._poll_task
+                if started is None or task is None or now - started < 10 or id(task) in stuck_reported:
+                    continue
+                stuck_reported.add(id(task))
+                self.logger.warning(
+                    "TRIAD POLL STUCK: %s check running for %.0fs; stuck at:\n%s",
+                    player.display_name,
+                    now - started,
+                    self._task_stack(task),
+                )
+            idle = now - self._last_poll_done
+            if idle >= 30 and (stopped_reported_at is None or now - stopped_reported_at >= 300):
+                stopped_reported_at = now
+                loops = [
+                    t
+                    for t in asyncio.all_tasks()
+                    if "_poll_players" in getattr(t.get_coro(), "__qualname__", "")
+                ]
+                self.logger.warning(
+                    "TRIAD POLLING STOPPED: no room checked for %.0fs; player poll loop(s) %d:\n%s",
+                    idle,
+                    len(loops),
+                    "\n---\n".join(self._task_stack(t) for t in loops) or "(no poll loop task found)",
+                )
+            elif idle < 30 and stopped_reported_at is not None:
+                stopped_reported_at = None
+                self.logger.warning("TRIAD POLLING RESUMED")
+
+    @staticmethod
+    def _task_stack(task: asyncio.Task[Any]) -> str:
+        """Return the current await chain of a task as text."""
+        # Task.print_stack shows only the outermost frame of a suspended coroutine; follow the await chain.
+        lines: list[str] = []
+        obj: Any = task.get_coro()
+        for _ in range(60):
+            frame = getattr(obj, "cr_frame", None) or getattr(obj, "gi_frame", None) or getattr(obj, "ag_frame", None)
+            if frame is not None:
+                code = frame.f_code
+                lines.append(f"  {code.co_filename}:{frame.f_lineno} in {code.co_qualname}")
+            nxt = getattr(obj, "cr_await", None) or getattr(obj, "gi_yieldfrom", None) or getattr(obj, "ag_await", None)
+            if nxt is None:
+                if obj is not None and frame is None:
+                    lines.append(f"  awaiting {obj!r}"[:400])
+                break
+            obj = nxt
+        return "\n".join(lines) or repr(task)
